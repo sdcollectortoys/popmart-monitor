@@ -12,22 +12,19 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
 PORT               = int(os.getenv("PORT",             "8000"))
 PUSHOVER_USER_KEY  = os.getenv("PUSHOVER_USER_KEY")
 PUSHOVER_API_TOKEN = os.getenv("PUSHOVER_API_TOKEN")
 
-# Comma-separated list of PopMart product URLs
 PRODUCT_URLS = [
     url.strip() for url in
     os.getenv("PRODUCT_URLS", "").split(",") if url.strip()
 ]
 
-# Can be a CSS selector (default) or an XPath (if it starts with "//")
 STOCK_SELECTOR = os.getenv("STOCK_SELECTOR", "").strip()
-
-# Number of seconds between checks (we’ll align to minute)
 CHECK_INTERVAL = 60
 
 logging.basicConfig(
@@ -43,7 +40,6 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
 
     def do_HEAD(self):
-        # Respond to health checks via HEAD
         self.send_response(200)
         self.end_headers()
 
@@ -58,14 +54,17 @@ def send_pushover(message: str):
     if not PUSHOVER_USER_KEY or not PUSHOVER_API_TOKEN:
         logging.warning("Pushover keys missing; skipping notification")
         return
-
     payload = {
         "token": PUSHOVER_API_TOKEN,
         "user":  PUSHOVER_USER_KEY,
         "message": message
     }
     try:
-        resp = requests.post("https://api.pushover.net/1/messages.json", data=payload, timeout=10)
+        resp = requests.post(
+            "https://api.pushover.net/1/messages.json",
+            data=payload,
+            timeout=10
+        )
         resp.raise_for_status()
         logging.info("✔️ Pushover sent")
     except Exception as e:
@@ -74,32 +73,43 @@ def send_pushover(message: str):
 # ─── Single-URL check ─────────────────────────────────────────────────────────
 def check_stock(url: str):
     logging.info(f"→ Checking {url}")
-    # Chrome options
+
     chrome_opts = Options()
     chrome_opts.binary_location = os.getenv("CHROME_BIN")
+    chrome_opts.set_capability("pageLoadStrategy", "eager")  # don't wait for full load
     for arg in ("--headless", "--no-sandbox", "--disable-dev-shm-usage"):
         chrome_opts.add_argument(arg)
 
     service = Service(os.getenv("CHROMEDRIVER_PATH"))
-    driver  = webdriver.Chrome(service=service, options=chrome_opts)
+    driver = webdriver.Chrome(service=service, options=chrome_opts)
+    driver.set_page_load_timeout(60)  # maximum wait for page load
 
     try:
-        driver.get(url)
-        time.sleep(5)  # allow JS and any overlays to load
+        # attempt to load the page (eager strategy + timeout)
+        try:
+            driver.get(url)
+        except TimeoutException:
+            logging.warning(f"Timeout loading page; proceeding anyway: {url}")
 
-        # ── Handle cookie/terms overlay ────────────────────────────────────────
+        # wait a bit for JS and overlays
+        time.sleep(5)
+
+        # ── Dismiss any terms/cookies overlay ─────────────────────────────────
         for xpath in (
             "//button[normalize-space()='ACCEPT']",
-            "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'accept')]"
+            "//div[contains(@class,'policy_acceptBtn')]",
         ):
-            elems = driver.find_elements(By.XPATH, xpath)
-            if elems:
-                elems[0].click()
-                logging.info("✓ Accepted terms overlay")
-                time.sleep(2)
+            btns = driver.find_elements(By.XPATH, xpath)
+            if btns:
+                try:
+                    btns[0].click()
+                    logging.info("✓ Accepted terms overlay")
+                    time.sleep(2)
+                except Exception:
+                    pass
                 break
 
-        # ── Check stock button ────────────────────────────────────────────────
+        # ── Stock check ─────────────────────────────────────────────────────
         if STOCK_SELECTOR.startswith("//"):
             elems = driver.find_elements(By.XPATH, STOCK_SELECTOR)
         else:
@@ -127,7 +137,7 @@ def main():
     logging.info("Starting monitor; first run at top of next minute")
 
     while True:
-        # sleep until the top of the next minute
+        # align to the top of the next minute
         now = time.time()
         to_sleep = CHECK_INTERVAL - (now % CHECK_INTERVAL)
         time.sleep(to_sleep)
