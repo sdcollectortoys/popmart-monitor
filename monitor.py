@@ -43,6 +43,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
 
     def do_HEAD(self):
+        # Respond to health checks via HEAD
         self.send_response(200)
         self.end_headers()
 
@@ -64,7 +65,7 @@ def send_pushover(message: str):
         "message": message
     }
     try:
-        resp = requests.post("https://api.pushover.net/1/messages.json", data=payload)
+        resp = requests.post("https://api.pushover.net/1/messages.json", data=payload, timeout=10)
         resp.raise_for_status()
         logging.info("✔️ Pushover sent")
     except Exception as e:
@@ -73,6 +74,7 @@ def send_pushover(message: str):
 # ─── Single-URL check ─────────────────────────────────────────────────────────
 def check_stock(url: str):
     logging.info(f"→ Checking {url}")
+    # Chrome options
     chrome_opts = Options()
     chrome_opts.binary_location = os.getenv("CHROME_BIN")
     for arg in ("--headless", "--no-sandbox", "--disable-dev-shm-usage"):
@@ -83,7 +85,21 @@ def check_stock(url: str):
 
     try:
         driver.get(url)
-        time.sleep(5)  # allow JS to load
+        time.sleep(5)  # allow JS and any overlays to load
+
+        # ── Handle cookie/terms overlay ────────────────────────────────────────
+        for xpath in (
+            "//button[normalize-space()='ACCEPT']",
+            "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'accept')]"
+        ):
+            elems = driver.find_elements(By.XPATH, xpath)
+            if elems:
+                elems[0].click()
+                logging.info("✓ Accepted terms overlay")
+                time.sleep(2)
+                break
+
+        # ── Check stock button ────────────────────────────────────────────────
         if STOCK_SELECTOR.startswith("//"):
             elems = driver.find_elements(By.XPATH, STOCK_SELECTOR)
         else:
@@ -95,6 +111,7 @@ def check_stock(url: str):
             send_pushover(msg)
         else:
             logging.info("   out of stock")
+
     except Exception as e:
         logging.error(f"Error on {url}: {e}")
     finally:
