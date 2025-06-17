@@ -42,6 +42,10 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"OK")
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
 def start_health_server():
     server = HTTPServer(("", PORT), HealthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -69,7 +73,6 @@ def send_pushover(message: str):
 # ─── Single-URL check ─────────────────────────────────────────────────────────
 def check_stock(url: str):
     logging.info(f"→ Checking {url}")
-    # Chrome options
     chrome_opts = Options()
     chrome_opts.binary_location = os.getenv("CHROME_BIN")
     for arg in ("--headless", "--no-sandbox", "--disable-dev-shm-usage"):
