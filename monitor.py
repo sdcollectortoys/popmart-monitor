@@ -19,20 +19,27 @@ PORT               = int(os.getenv("PORT",             "8000"))
 PUSHOVER_USER_KEY  = os.getenv("PUSHOVER_USER_KEY")
 PUSHOVER_API_TOKEN = os.getenv("PUSHOVER_API_TOKEN")
 
+# Comma-separated PopMart URLs
 PRODUCT_URLS = [
     url.strip() for url in
     os.getenv("PRODUCT_URLS", "").split(",") if url.strip()
 ]
 
+# CSS selector or XPath for "add to bag"
 STOCK_SELECTOR = os.getenv("STOCK_SELECTOR", "").strip()
+
+# Seconds between cycles
 CHECK_INTERVAL = 60
+
+# Maximum time to wait for page load (in seconds)
+PAGE_LOAD_TIMEOUT = 30
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
 
-# ─── Health-check server ──────────────────────────────────────────────────────
+# ─── Health-check server ────────────────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -54,6 +61,7 @@ def send_pushover(message: str):
     if not PUSHOVER_USER_KEY or not PUSHOVER_API_TOKEN:
         logging.warning("Pushover keys missing; skipping notification")
         return
+
     payload = {
         "token": PUSHOVER_API_TOKEN,
         "user":  PUSHOVER_USER_KEY,
@@ -70,52 +78,52 @@ def send_pushover(message: str):
     except Exception as e:
         logging.error(f"❌ Pushover error: {e}")
 
-# ─── Single-URL check ─────────────────────────────────────────────────────────
+# ─── Single-URL check ───────────────────────────────────────────────────────────
 def check_stock(url: str):
     logging.info(f"→ Checking {url}")
-
     chrome_opts = Options()
     chrome_opts.binary_location = os.getenv("CHROME_BIN")
-    chrome_opts.set_capability("pageLoadStrategy", "eager")  # don't wait for full load
+    # return once DOM is interactive
+    chrome_opts.set_capability("pageLoadStrategy", "eager")
     for arg in ("--headless", "--no-sandbox", "--disable-dev-shm-usage"):
         chrome_opts.add_argument(arg)
 
     service = Service(os.getenv("CHROMEDRIVER_PATH"))
     driver = webdriver.Chrome(service=service, options=chrome_opts)
-    driver.set_page_load_timeout(60)  # maximum wait for page load
+    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
 
     try:
-        # attempt to load the page (eager strategy + timeout)
+        # try to load; if it times out, continue anyway
         try:
             driver.get(url)
         except TimeoutException:
-            logging.warning(f"Timeout loading page; proceeding anyway: {url}")
+            logging.warning(f"⚠️ Timeout loading page; proceeding: {url}")
 
-        # wait a bit for JS and overlays
+        # give a moment for JS overlays
         time.sleep(5)
 
-        # ── Dismiss any terms/cookies overlay ─────────────────────────────────
+        # ── Dismiss terms/cookies overlay if present
         for xpath in (
             "//button[normalize-space()='ACCEPT']",
-            "//div[contains(@class,'policy_acceptBtn')]",
+            "//div[contains(@class,'policy_acceptBtn')]"
         ):
-            btns = driver.find_elements(By.XPATH, xpath)
-            if btns:
+            els = driver.find_elements(By.XPATH, xpath)
+            if els:
                 try:
-                    btns[0].click()
+                    els[0].click()
                     logging.info("✓ Accepted terms overlay")
                     time.sleep(2)
                 except Exception:
                     pass
                 break
 
-        # ── Stock check ─────────────────────────────────────────────────────
+        # ── Check for “add to bag” button
         if STOCK_SELECTOR.startswith("//"):
-            elems = driver.find_elements(By.XPATH, STOCK_SELECTOR)
+            matches = driver.find_elements(By.XPATH, STOCK_SELECTOR)
         else:
-            elems = driver.find_elements(By.CSS_SELECTOR, STOCK_SELECTOR)
+            matches = driver.find_elements(By.CSS_SELECTOR, STOCK_SELECTOR)
 
-        if elems:
+        if matches:
             msg = f"[{datetime.now():%H:%M}] IN STOCK → {url}"
             logging.info(msg)
             send_pushover(msg)
@@ -137,7 +145,7 @@ def main():
     logging.info("Starting monitor; first run at top of next minute")
 
     while True:
-        # align to the top of the next minute
+        # align with top of minute
         now = time.time()
         to_sleep = CHECK_INTERVAL - (now % CHECK_INTERVAL)
         time.sleep(to_sleep)
