@@ -10,19 +10,17 @@ import requests
 from bs4 import BeautifulSoup
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-PORT               = int(os.getenv("PORT", "8000"))
-PUSHOVER_USER_KEY  = os.getenv("PUSHOVER_USER_KEY")
-PUSHOVER_API_TOKEN = os.getenv("PUSHOVER_API_TOKEN")
-PRODUCT_URLS       = [u.strip() for u in os.getenv("PRODUCT_URLS", "").split(",") if u.strip()]
-# the text fragment to look for in the “Add to bag” button
-STOCK_TEXT         = os.getenv("STOCK_TEXT", "add to bag").lower()
-# custom UA to pretend we’re a real browser
-USER_AGENT         = os.getenv(
+PORT            = int(os.getenv("PORT", "8000"))
+PUSH_KEY        = os.getenv("PUSHOVER_USER_KEY")
+PUSH_TOKEN      = os.getenv("PUSHOVER_API_TOKEN")
+PRODUCT_URLS    = [u.strip() for u in os.getenv("PRODUCT_URLS", "").split(",") if u.strip()]
+STOCK_TEXT      = os.getenv("STOCK_TEXT", "add to bag").lower()
+USER_AGENT      = os.getenv(
     "USER_AGENT",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.7151.103 Safari/537.36"
 )
-CHECK_INTERVAL     = 60    # seconds between runs
-REQUEST_TIMEOUT    = 10    # seconds per HTTP request
+CHECK_INTERVAL  = 60
+REQUEST_TIMEOUT = 10
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,13 +42,13 @@ def start_health_server():
 
 # ─── PUSHOVER ALERT ────────────────────────────────────────────────────────────
 def send_pushover(msg: str):
-    if not (PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN):
+    if not (PUSH_KEY and PUSH_TOKEN):
         logging.warning("Pushover keys missing; skipping")
         return
     try:
         r = requests.post(
             "https://api.pushover.net/1/messages.json",
-            data={"token": PUSHOVER_API_TOKEN, "user": PUSHOVER_USER_KEY, "message": msg},
+            data={"token": PUSH_TOKEN, "user": PUSH_KEY, "message": msg},
             timeout=REQUEST_TIMEOUT
         )
         r.raise_for_status()
@@ -69,12 +67,10 @@ def check_stock(url: str):
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # find any <button> whose text includes STOCK_TEXT
-        found = False
-        for btn in soup.find_all("button"):
-            if STOCK_TEXT in btn.get_text(strip=True).lower():
-                found = True
-                break
+        found = any(
+            STOCK_TEXT in btn.get_text(strip=True).lower()
+            for btn in soup.find_all("button")
+        )
 
         if found:
             msg = f"[{datetime.now():%H:%M}] IN STOCK → {url}"
@@ -83,8 +79,8 @@ def check_stock(url: str):
         else:
             logging.info("   out of stock")
 
-    except Exception as e:
-        logging.error(f"Error on {url}: {e}")
+    except Exception:
+        logging.exception(f"Error checking {url}")
     finally:
         logging.info(f"← END   {url}")
 
@@ -95,17 +91,24 @@ def main():
         return
 
     start_health_server()
-    logging.info("Starting; first run at top of next minute")
+    logging.info("Starting monitor; aligning to top of next minute")
+
+    # align once at startup
+    to_sleep = CHECK_INTERVAL - (time.time() % CHECK_INTERVAL)
+    time.sleep(to_sleep)
 
     while True:
-        # align to next minute
-        to_sleep = CHECK_INTERVAL - (time.time() % CHECK_INTERVAL)
-        time.sleep(to_sleep)
-
-        logging.info("🔄 Cycle START")
-        for u in PRODUCT_URLS:
-            check_stock(u)
-        logging.info("✅ Cycle END\n")
+        try:
+            logging.info("🔄 Cycle START")
+            for url in PRODUCT_URLS:
+                check_stock(url)
+            logging.info("✅ Cycle END")
+        except Exception:
+            logging.exception("💥 Uncaught error in cycle")
+        finally:
+            # sleep until next minute tick, even after error
+            to_sleep = CHECK_INTERVAL - (time.time() % CHECK_INTERVAL)
+            time.sleep(to_sleep)
 
 if __name__ == "__main__":
     main()
