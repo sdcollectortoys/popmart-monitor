@@ -1,2 +1,9 @@
+# start.sh
 #!/usr/bin/env bash
-exec python -u monitor.py
+set -e
+while true; do
+  echo "▶️  Starting monitor.py at $(date)"
+  python -u monitor.py
+  echo "⚠️  monitor.py exited unexpectedly with code $? — restarting in 5 s" >&2
+  sleep 5
+done

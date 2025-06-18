@@ -1,3 +1,4 @@
+# monitor.py
 #!/usr/bin/env python3
 import os
 import time
@@ -10,17 +11,17 @@ import requests
 from bs4 import BeautifulSoup
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-PORT            = int(os.getenv("PORT", "8000"))
+PORT            = int(os.getenv("PORT",             "8000"))
 PUSH_KEY        = os.getenv("PUSHOVER_USER_KEY")
 PUSH_TOKEN      = os.getenv("PUSHOVER_API_TOKEN")
 PRODUCT_URLS    = [u.strip() for u in os.getenv("PRODUCT_URLS", "").split(",") if u.strip()]
-STOCK_TEXT      = os.getenv("STOCK_TEXT", "add to bag").lower()
-USER_AGENT      = os.getenv(
-    "USER_AGENT",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.7151.103 Safari/537.36"
+STOCK_TEXT      = os.getenv("STOCK_TEXT",          "add to bag").lower()
+USER_AGENT      = os.getenv("USER_AGENT",          
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/137.0.7151.103 Safari/537.36"
 )
-CHECK_INTERVAL  = 60
-REQUEST_TIMEOUT = 10
+CHECK_INTERVAL  = 60   # seconds between cycles
+REQUEST_TIMEOUT = 10   # HTTP request timeout
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,20 +39,20 @@ def start_health_server():
     server = HTTPServer(("", PORT), HealthHandler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
-    logging.info(f"Health check on port {PORT}")
+    logging.info(f"Health check listening on port {PORT}")
 
-# ─── PUSHOVER ALERT ────────────────────────────────────────────────────────────
+# ─── PUSHOVER ──────────────────────────────────────────────────────────────────
 def send_pushover(msg: str):
     if not (PUSH_KEY and PUSH_TOKEN):
-        logging.warning("Pushover keys missing; skipping")
+        logging.warning("Pushover keys missing; skipping notification")
         return
     try:
-        r = requests.post(
+        resp = requests.post(
             "https://api.pushover.net/1/messages.json",
             data={"token": PUSH_TOKEN, "user": PUSH_KEY, "message": msg},
             timeout=REQUEST_TIMEOUT
         )
-        r.raise_for_status()
+        resp.raise_for_status()
         logging.info("✔️ Pushover sent")
     except Exception as e:
         logging.error(f"Pushover error: {e}")
@@ -63,14 +64,16 @@ session.headers.update({"User-Agent": USER_AGENT})
 def check_stock(url: str):
     logging.info(f"→ START {url}")
     try:
-        resp = session.get(url, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
+        r = session.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
 
-        found = any(
-            STOCK_TEXT in btn.get_text(strip=True).lower()
-            for btn in soup.find_all("button")
-        )
+        # look for any <button> containing our STOCK_TEXT
+        found = False
+        for btn in soup.find_all("button"):
+            if STOCK_TEXT in btn.get_text(strip=True).lower():
+                found = True
+                break
 
         if found:
             msg = f"[{datetime.now():%H:%M}] IN STOCK → {url}"
@@ -91,22 +94,21 @@ def main():
         return
 
     start_health_server()
-    logging.info("Starting monitor; aligning to top of next minute")
+    logging.info("Starting monitor; first run at top of next minute")
 
-    # align once at startup
+    # align to the next minute
     to_sleep = CHECK_INTERVAL - (time.time() % CHECK_INTERVAL)
     time.sleep(to_sleep)
 
     while True:
         try:
             logging.info("🔄 Cycle START")
-            for url in PRODUCT_URLS:
-                check_stock(url)
+            for u in PRODUCT_URLS:
+                check_stock(u)
             logging.info("✅ Cycle END")
         except Exception:
             logging.exception("💥 Uncaught error in cycle")
         finally:
-            # sleep until next minute tick, even after error
             to_sleep = CHECK_INTERVAL - (time.time() % CHECK_INTERVAL)
             time.sleep(to_sleep)
 
