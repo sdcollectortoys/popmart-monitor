@@ -1,4 +1,4 @@
-# start.sh
+# start.sh  (make sure this file is saved with Unix LF endings, no BOM)
 #!/usr/bin/env bash
 set -e
 while true; do
