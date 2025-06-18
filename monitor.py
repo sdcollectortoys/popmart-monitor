@@ -1,4 +1,3 @@
-# monitor.py
 #!/usr/bin/env python3
 import os, time, threading, logging
 from datetime import datetime
@@ -25,14 +24,14 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200); self.end_headers()
 
 def start_health_server():
-    server = HTTPServer(("", PORT), HealthHandler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
+    srv = HTTPServer(("", PORT), HealthHandler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     logging.info(f"Health check on port {PORT}")
 
 def send_pushover(msg):
     if not (PUSH_KEY and PUSH_TOKEN):
-        logging.warning("Missing Pushover keys; skipping")
+        logging.warning("Missing Pushover keys")
         return
     try:
         r = requests.post(
@@ -54,8 +53,8 @@ def check_stock(url):
         r = session.get(url, timeout=REQUEST_TIMEOUT); r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         found = any(
-            STOCK_TEXT in btn.get_text(strip=True).lower()
-            for btn in soup.find_all("button")
+            STOCK_TEXT in b.get_text(strip=True).lower()
+            for b in soup.find_all("button")
         )
         if found:
             msg = f"[{datetime.now():%H:%M}] IN STOCK → {url}"
@@ -72,8 +71,7 @@ def main():
         logging.error("No PRODUCT_URLS set"); return
     start_health_server()
     # align to next minute
-    to_sleep = CHECK_INTERVAL - (time.time() % CHECK_INTERVAL)
-    time.sleep(to_sleep)
+    time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
     while True:
         try:
             logging.info("🔄 Cycle START")
@@ -82,8 +80,7 @@ def main():
         except Exception:
             logging.exception("💥 Uncaught error in cycle")
         finally:
-            to_sleep = CHECK_INTERVAL - (time.time() % CHECK_INTERVAL)
-            time.sleep(to_sleep)
+            time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
 
 if __name__ == "__main__":
     main()
