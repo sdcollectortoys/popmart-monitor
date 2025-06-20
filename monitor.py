@@ -7,7 +7,7 @@ import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
@@ -18,7 +18,7 @@ PRODUCT_URLS   = [u.strip() for u in os.getenv("PRODUCT_URLS","").split(",") if 
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL","60"))
 PAGE_TIMEOUT   = int(os.getenv("PAGE_TIMEOUT","15"))
-WAIT_AFTER     = 2  # seconds to wait after any click
+WAIT_AFTER     = 2  # seconds to wait after each click
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -50,17 +50,17 @@ def send_pushover(msg: str):
     except Exception as e:
         logging.error("Pushover error: %s", e)
 
-# ─── STOCK CHECK ───────────────────────────────────────────────────────────────
+# ─── SINGLE CHECK ───────────────────────────────────────────────────────────────
 def check_stock(url: str):
     logging.info("🚨 DEBUG MODE: check_stock() invoked")
 
-    # headless Chrome setup
+    # headless Chrome
     opts = Options()
     for f in ("--headless","--no-sandbox","--disable-dev-shm-usage"):
         opts.add_argument(f)
     opts.page_load_strategy = "eager"
-    service = Service(os.getenv("CHROMEDRIVER_PATH","/usr/bin/chromedriver"))
-    driver  = webdriver.Chrome(service=service, options=opts)
+    serv = Service(os.getenv("CHROMEDRIVER_PATH","/usr/bin/chromedriver"))
+    driver = webdriver.Chrome(service=serv, options=opts)
     driver.set_page_load_timeout(PAGE_TIMEOUT)
 
     try:
@@ -72,33 +72,31 @@ def check_stock(url: str):
 
         time.sleep(WAIT_AFTER)
 
-        # dismiss overlay if present
+        # dismiss T&C overlay
         try:
-            btn = driver.find_element(By.XPATH, "//div[contains(@class,'policy_acceptBtn')]")
-            btn.click()
+            ov = driver.find_element(By.XPATH, "//div[contains(@class,'policy_acceptBtn')]")
+            ov.click()
             logging.info("✓ Accepted T&C overlay")
             time.sleep(WAIT_AFTER)
         except Exception:
             pass
 
-        # click the "Single Box" variant if it exists
+        # select "Single Box" if present
         try:
-            variants = driver.find_elements(
-                By.XPATH,
+            btns = driver.find_elements(By.XPATH,
                 "//button[contains(normalize-space(.),'Single Box')]"
             )
-            if variants:
-                variants[0].click()
+            if btns:
+                btns[0].click()
                 logging.info("✓ Selected Single Box variant")
                 time.sleep(WAIT_AFTER)
         except Exception as e:
             logging.warning(f"Variant click failed: {e}")
 
-        # now just get all the <button> tags and look for "add to bag"
+        # scan only the small set of <button> tags for "Add to Bag"
         in_stock = False
         try:
-            buttons = driver.find_elements(By.TAG_NAME, "button")
-            for b in buttons:
+            for b in driver.find_elements(By.TAG_NAME, "button"):
                 txt = b.text.strip().lower()
                 if "add to bag" in txt:
                     in_stock = True
@@ -108,7 +106,7 @@ def check_stock(url: str):
         except Exception as e:
             logging.warning(f"Button scan failed: {e}")
 
-        # alert or not
+        # alert
         if in_stock:
             msg = f"[{datetime.now():%H:%M}] IN STOCK → {url}"
             logging.info(msg)
@@ -125,11 +123,9 @@ def check_stock(url: str):
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 def main():
     if not PRODUCT_URLS:
-        logging.error("No PRODUCT_URLS set in env")
-        return
+        logging.error("No PRODUCT_URLS set in env"); return
 
     start_health_server()
-    # align to next minute
     time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
 
     while True:
