@@ -1,8 +1,6 @@
+# monitor.py
 #!/usr/bin/env python3
-import os
-import time
-import threading
-import logging
+import os, time, threading, logging
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -11,50 +9,40 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 PORT         = int(os.getenv("PORT", "8000"))
 PUSH_KEY     = os.getenv("PUSHOVER_USER_KEY")
 PUSH_TOKEN   = os.getenv("PUSHOVER_API_TOKEN")
-PRODUCT_URLS = [
-    u.strip()
-    for u in os.getenv("PRODUCT_URLS", "").split(",")
-    if u.strip()
-]
+PRODUCT_URLS = [u.strip() for u in os.getenv("PRODUCT_URLS","").split(",") if u.strip()]
 
-# Hard-coded default XPath (ignores any removed env var)
+# always use this default XPath
 STOCK_SELECTOR = (
     "//*[contains(translate(normalize-space(.),"
     " 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
     " 'add to bag')]"
 )
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
-PAGE_TIMEOUT   = int(os.getenv("PAGE_TIMEOUT",   "15"))
-WAIT_BEFORE    = 3   # seconds to let JS and overlays settle
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL","60"))
+PAGE_TIMEOUT   = int(os.getenv("PAGE_TIMEOUT","15"))
+WAIT_BEFORE    = 3
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
+# ─── HEALTH CHECK ──────────────────────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
+        self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
     def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
+        self.send_response(200); self.end_headers()
 
 def start_health_server():
     srv = HTTPServer(("", PORT), HealthHandler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     logging.info(f"Health check listening on port {PORT}")
 
-# ─── PUSHOVER ─────────────────────────────────────────────────────────────────
+# ─── PUSHOVER ──────────────────────────────────────────────────────────────────
 def send_pushover(msg: str):
     if not (PUSH_KEY and PUSH_TOKEN):
         logging.warning("Missing Pushover creds; skipping alert")
@@ -62,7 +50,7 @@ def send_pushover(msg: str):
     try:
         r = requests.post(
             "https://api.pushover.net/1/messages.json",
-            data={"token": PUSH_TOKEN, "user": PUSH_KEY, "message": msg},
+            data={"token":PUSH_TOKEN,"user":PUSH_KEY,"message":msg},
             timeout=10
         )
         r.raise_for_status()
@@ -70,18 +58,18 @@ def send_pushover(msg: str):
     except Exception as e:
         logging.error("Pushover error: %s", e)
 
-# ─── SINGLE STOCK CHECK ───────────────────────────────────────────────────────
+# ─── SINGLE CHECK ──────────────────────────────────────────────────────────────
 def check_stock(url: str):
-    # Must see these two lines or this code never deployed
+    # confirm this code actually ran
     logging.info("🚨 DEBUG MODE: check_stock() invoked")
     logging.info(f"🚨 DEBUG MODE: STOCK_SELECTOR = {STOCK_SELECTOR!r}")
 
-    # Headless Chrome setup
     opts = Options()
     for flag in ("--headless","--no-sandbox","--disable-dev-shm-usage"):
         opts.add_argument(flag)
     opts.page_load_strategy = "eager"
-    service = Service(os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver"))
+
+    service = Service(os.getenv("CHROMEDRIVER_PATH","/usr/bin/chromedriver"))
     driver  = webdriver.Chrome(service=service, options=opts)
     driver.set_page_load_timeout(PAGE_TIMEOUT)
 
@@ -89,52 +77,52 @@ def check_stock(url: str):
         logging.info(f"→ START {url}")
         try:
             driver.get(url)
-        except TimeoutException as e:
-            logging.warning(f"⚠️ Page‐load timeout; continuing anyway: {e}")
+        except TimeoutException:
+            logging.warning("⚠️ Page‐load timeout; continuing")
 
         time.sleep(WAIT_BEFORE)
 
-        # ─── safe overlay click ──────────────────────────────────────
+        # safe overlay-click
         try:
-            overlays = driver.find_elements(
-                By.XPATH,
-                "//div[contains(@class,'policy_acceptBtn')]"
-            )
-            if overlays:
-                try:
-                    overlays[0].click()
-                    logging.info("✓ Accepted overlay")
-                    time.sleep(1)
-                except Exception as e:
-                    logging.warning(f"Overlay click failed, continuing: {e}")
+            ov = driver.find_elements(By.XPATH, "//div[contains(@class,'policy_acceptBtn')]")
+            if ov:
+                ov[0].click()
+                logging.info("✓ Accepted overlay")
+                time.sleep(1)
         except Exception as e:
-            logging.warning(f"Could not find overlay button: {e}")
+            logging.warning(f"Overlay-click failed, continuing: {e}")
 
-        # ─── DEBUG #1: raw HTML check ────────────────────────────────
+        # ── DEBUG #1: raw HTML check ───────────────────────────────────
+        raw_html = ""
         try:
-            raw  = driver.page_source.replace("\u00A0"," ")
-            lower = raw.lower()
-            has_sub = "add to bag" in lower
-            logging.info(f"   debug1: raw HTML contains 'add to bag'? {has_sub}")
-            if has_sub:
-                idx = lower.find("add to bag")
-                snippet = raw[max(0, idx-80): idx+80].replace("\n"," ")
-                logging.info(f"   debug1 snippet: …{snippet}…")
-        except Exception as e:
-            logging.warning(f"debug1 raw‐HTML timed out/skipped: {e}")
+            raw_html = driver.page_source.replace("\u00A0"," ")
+        except (TimeoutException, WebDriverException) as e:
+            logging.warning(f"raw page_source timed out or failed: {e}")
+            try:
+                # fallback via JS
+                raw_html = driver.execute_script(
+                    "return document.documentElement.outerHTML"
+                ).replace("\u00A0"," ")
+                logging.info("   debug1: fallback outerHTML succeeded")
+            except Exception as je:
+                logging.warning(f"fallback outerHTML also failed: {je}")
 
-        # ─── DEBUG #2: XPath element matches ────────────────────────
-        try:
-            elems = driver.find_elements(By.XPATH, STOCK_SELECTOR)
-            logging.info(f"   debug2: STOCK_SELECTOR matched {len(elems)} element(s)")
-            for e in elems:
-                logging.info(f"      → tag={e.tag_name!r}, text={e.text!r}")
-        except Exception as e:
-            logging.warning(f"debug2 find_elements failed: {e}")
-            elems = []
+        low = raw_html.lower()
+        found_sub = "add to bag" in low
+        logging.info(f"   debug1: raw HTML contains 'add to bag'? {found_sub}")
+        if found_sub:
+            idx = low.find("add to bag")
+            snippet = raw_html[max(0, idx-80):idx+80].replace("\n"," ")
+            logging.info(f"   debug1 snippet: …{snippet}…")
 
-        # ─── FINAL DECISION ─────────────────────────────────────────
-        if elems:
+        # ── DEBUG #2: XPath matches ───────────────────────────────────
+        matches = driver.find_elements(By.XPATH, STOCK_SELECTOR)
+        logging.info(f"   debug2: STOCK_SELECTOR matched {len(matches)} element(s)")
+        for el in matches:
+            logging.info(f"      → tag={el.tag_name!r}, text={el.text!r}")
+
+        # ── ALERT DECISION ───────────────────────────────────────────
+        if matches:
             msg = f"[{datetime.now():%H:%M}] IN STOCK → {url}"
             logging.info(msg)
             send_pushover(msg)
@@ -154,7 +142,6 @@ def main():
         return
 
     start_health_server()
-    # align to top of next minute
     time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
 
     while True:
