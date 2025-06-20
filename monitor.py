@@ -10,7 +10,7 @@ import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
@@ -18,14 +18,18 @@ from selenium.webdriver.support import expected_conditions as EC
 PORT          = int(os.getenv("PORT", "8000"))
 PUSH_KEY      = os.getenv("PUSHOVER_USER_KEY")
 PUSH_TOKEN    = os.getenv("PUSHOVER_API_TOKEN")
-PRODUCT_URLS  = [u.strip() for u in os.getenv("PRODUCT_URLS","").split(",") if u.strip()]
+PRODUCT_URLS  = [
+    u.strip()
+    for u in os.getenv("PRODUCT_URLS", "").split(",")
+    if u.strip()
+]
 
-# FALLBACK: JS snippet will look for this substring in textContent
+# If Next.js JSON fails, we’ll fallback to scanning textContent for this:
 FALLBACK_TEXT = "add to bag"
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL","60"))
 PAGE_TIMEOUT   = int(os.getenv("PAGE_TIMEOUT","15"))
-WAIT_BEFORE    = 3  # seconds to wait for Next.js hydration
+WAIT_BEFORE    = 3  # seconds to let Next.js hydrate
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,12 +39,9 @@ logging.basicConfig(
 # ─── HEALTH CHECK ──────────────────────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
+        self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
     def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
+        self.send_response(200); self.end_headers()
 
 def start_health_server():
     srv = HTTPServer(("", PORT), HealthHandler)
@@ -63,16 +64,16 @@ def send_pushover(msg: str):
     except Exception as e:
         logging.error("Pushover error: %s", e)
 
-# ─── SINGLE CHECK ──────────────────────────────────────────────────────────────
+# ─── STOCK CHECK ───────────────────────────────────────────────────────────────
 def check_stock(url: str):
     logging.info("🚨 DEBUG MODE: check_stock() invoked")
 
+    # set up headless Chrome
     opts = Options()
-    for flag in ("--headless", "--no-sandbox", "--disable-dev-shm-usage"):
+    for flag in ("--headless","--no-sandbox","--disable-dev-shm-usage"):
         opts.add_argument(flag)
     opts.page_load_strategy = "eager"
-
-    service = Service(os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver"))
+    service = Service(os.getenv("CHROMEDRIVER_PATH","/usr/bin/chromedriver"))
     driver  = webdriver.Chrome(service=service, options=opts)
     driver.set_page_load_timeout(PAGE_TIMEOUT)
 
@@ -83,32 +84,36 @@ def check_stock(url: str):
         except TimeoutException:
             logging.warning("⚠️ Page-load timeout; continuing anyway")
 
-        # give Next.js data a moment to appear
+        # wait for Next.js JSON blob
         try:
             WebDriverWait(driver, WAIT_BEFORE).until(
                 lambda d: d.execute_script("return !!window.__NEXT_DATA__")
             )
         except TimeoutException:
-            logging.warning("⚠️ NEXT_DATA did not load in time; will fallback to JS scan")
+            logging.warning("⚠️ __NEXT_DATA__ not present in time")
 
-        # ─── PRIMARY CHECK: JSON from Next.js ───────────────────────────────────
+        # ─── PRIMARY: read Next.js JSON ────────────────────────────────────────────
         in_stock = False
         try:
-            data = driver.execute_script("return window.__NEXT_DATA__.props.pageProps.product")
-            sold_out = data.get("skuInfos", [{}])[0].get("soldOut", True)
+            prod = driver.execute_script(
+                "return window.__NEXT_DATA__.props.pageProps.product"
+            )
+            sold_out = prod.get("skuInfos", [{}])[0].get("soldOut", True)
             in_stock = not sold_out
             logging.info(f"   debug JSON soldOut={sold_out}, inStock={in_stock}")
         except Exception as e:
             logging.warning(f"JSON lookup failed: {e}")
 
-        # ─── FALLBACK CHECK: JS text scan ────────────────────────────────────────
+        # ─── FALLBACK: scan textContent via JS ────────────────────────────────────
         if not in_stock:
             try:
                 count = driver.execute_script(f"""
                     return Array.from(document.querySelectorAll('*'))
-                      .filter(el => el.textContent && 
-                                     el.textContent.toLowerCase().includes('{FALLBACK_TEXT}'))
-                      .length;
+                      .reduce((sum, el) => 
+                        sum + (el.textContent||"")
+                          .toLowerCase()
+                          .includes("{FALLBACK_TEXT}")|0
+                      , 0);
                 """)
                 logging.info(f"   debug JS fallback found {count} elements containing '{FALLBACK_TEXT}'")
                 in_stock = (count > 0)
@@ -136,7 +141,7 @@ def main():
         return
 
     start_health_server()
-    # align to next minute boundary
+    # align to top of the next minute
     time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
 
     while True:
