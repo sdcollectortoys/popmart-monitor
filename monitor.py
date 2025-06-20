@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 import os
 import time
-import logging
 import threading
+import logging
 import json
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
 from bs4 import BeautifulSoup
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-PORT          = int(os.getenv("PORT", "8000"))
-PUSH_KEY      = os.getenv("PUSHOVER_USER_KEY")
-PUSH_TOKEN    = os.getenv("PUSHOVER_API_TOKEN")
-PRODUCT_URLS  = [u.strip() for u in os.getenv("PRODUCT_URLS","").split(",") if u.strip()]
-CHECK_INTERVAL= int(os.getenv("CHECK_INTERVAL","60"))  # seconds between cycles
+PORT            = int(os.getenv("PORT", "8000"))
+PUSH_KEY        = os.getenv("PUSHOVER_USER_KEY")
+PUSH_TOKEN      = os.getenv("PUSHOVER_API_TOKEN")
+PRODUCT_URLS    = [u.strip() for u in os.getenv("PRODUCT_URLS","").split(",") if u.strip()]
+CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL","60"))
 REQUEST_TIMEOUT = 10  # seconds for HTTP GET
 
 HEADERS = {
@@ -30,12 +30,9 @@ logging.basicConfig(
 # ─── HEALTH CHECK ──────────────────────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
+        self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
     def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
+        self.send_response(200); self.end_headers()
 
 def start_health_server():
     server = HTTPServer(("", PORT), HealthHandler)
@@ -50,7 +47,7 @@ def send_pushover(msg: str):
     try:
         resp = requests.post(
             "https://api.pushover.net/1/messages.json",
-            data={"token": PUSH_TOKEN, "user": PUSH_KEY, "message": msg},
+            data={"token":PUSH_TOKEN, "user":PUSH_KEY, "message": msg},
             timeout=REQUEST_TIMEOUT
         )
         resp.raise_for_status()
@@ -74,9 +71,31 @@ def check_stock(url: str):
         logging.error("   no __NEXT_DATA__ JSON on page")
         return
 
+    # parse JSON
     try:
         data = json.loads(script.string)
-        prod = data["props"]["pageProps"]["product"]
+    except Exception as e:
+        logging.error("   JSON loads error: %s", e)
+        return
+
+    # dump structure
+    top_keys   = list(data.keys())
+    props      = data.get("props", {})
+    props_keys = list(props.keys())
+    pageProps  = props.get("pageProps", {})
+    pp_keys    = list(pageProps.keys())
+
+    logging.info(f"   debug JSON top keys: {top_keys}")
+    logging.info(f"   debug JSON props keys: {props_keys}")
+    logging.info(f"   debug JSON pageProps keys: {pp_keys}")
+
+    # try to find the product blob
+    if "product" not in pageProps:
+        logging.error("   'product' not in pageProps; cannot determine stock")
+        return
+
+    try:
+        prod     = pageProps["product"]
         sold_out = prod["skuInfos"][0].get("soldOut", True)
         in_stock = not sold_out
         logging.info(f"   debug JSON soldOut={sold_out}, inStock={in_stock}")
@@ -84,6 +103,7 @@ def check_stock(url: str):
         logging.error("   JSON parse error: %s", e)
         return
 
+    # final alert logic
     if in_stock:
         msg = f"[{datetime.now():%H:%M}] IN STOCK → {url}"
         logging.info(msg)
@@ -98,7 +118,6 @@ def main():
         return
 
     start_health_server()
-    # align to the top of the next interval
     time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
 
     while True:
