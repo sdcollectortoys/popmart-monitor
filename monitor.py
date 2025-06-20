@@ -1,45 +1,33 @@
 #!/usr/bin/env python3
-import os
-import time
-import logging
-import threading
+import os, time, threading, logging
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.common.by import By
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-PORT             = int(os.getenv("PORT", "8000"))
-PUSH_KEY         = os.getenv("PUSHOVER_USER_KEY")
-PUSH_TOKEN       = os.getenv("PUSHOVER_API_TOKEN")
-PRODUCT_URLS     = [
-    u.strip() for u in os.getenv("PRODUCT_URLS", "").split(",") if u.strip()
-]
-CHECK_INTERVAL   = int(os.getenv("CHECK_INTERVAL", "60"))
-REQUEST_TIMEOUT  = 10  # seconds
+PORT           = int(os.getenv("PORT", "8000"))
+PUSH_KEY       = os.getenv("PUSHOVER_USER_KEY")
+PUSH_TOKEN     = os.getenv("PUSHOVER_API_TOKEN")
+PRODUCT_URLS   = [u.strip() for u in os.getenv("PRODUCT_URLS","").split(",") if u.strip()]
 
-# Substrings to look for
-IN_STOCK_MARKER    = "add to bag"
-OUT_OF_STOCK_MARKER = "notify me when available"
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL","60"))
+PAGE_TIMEOUT   = int(os.getenv("PAGE_TIMEOUT","15"))
+WAIT_AFTER     = 2  # seconds to wait after any click
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; stock-monitor/1.0)"
-}
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # ─── HEALTH CHECK ──────────────────────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
+        self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
     def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
+        self.send_response(200); self.end_headers()
 
 def start_health_server():
     server = HTTPServer(("", PORT), HealthHandler)
@@ -52,49 +40,87 @@ def send_pushover(msg: str):
         logging.warning("Missing Pushover creds; skipping alert")
         return
     try:
-        resp = requests.post(
+        r = requests.post(
             "https://api.pushover.net/1/messages.json",
-            data={"token": PUSH_TOKEN, "user": PUSH_KEY, "message": msg},
-            timeout=REQUEST_TIMEOUT
+            data={"token":PUSH_TOKEN, "user":PUSH_KEY, "message":msg},
+            timeout=10
         )
-        resp.raise_for_status()
+        r.raise_for_status()
         logging.info("✔️ Pushover sent")
     except Exception as e:
         logging.error("Pushover error: %s", e)
 
 # ─── STOCK CHECK ───────────────────────────────────────────────────────────────
 def check_stock(url: str):
-    logging.info(f"→ START {url}")
+    logging.info("🚨 DEBUG MODE: check_stock() invoked")
+
+    # headless Chrome setup
+    opts = Options()
+    for f in ("--headless","--no-sandbox","--disable-dev-shm-usage"):
+        opts.add_argument(f)
+    opts.page_load_strategy = "eager"
+    service = Service(os.getenv("CHROMEDRIVER_PATH","/usr/bin/chromedriver"))
+    driver  = webdriver.Chrome(service=service, options=opts)
+    driver.set_page_load_timeout(PAGE_TIMEOUT)
+
     try:
-        r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-    except Exception as e:
-        logging.error("HTTP error fetching %s: %s", url, e)
-        return
+        logging.info(f"→ START {url}")
+        try:
+            driver.get(url)
+        except TimeoutException:
+            logging.warning("⚠️ page-load timeout; continuing")
 
-    txt = r.text.lower()
+        time.sleep(WAIT_AFTER)
 
-    has_add    = IN_STOCK_MARKER in txt
-    has_notify = OUT_OF_STOCK_MARKER in txt
+        # dismiss overlay if present
+        try:
+            btn = driver.find_element(By.XPATH, "//div[contains(@class,'policy_acceptBtn')]")
+            btn.click()
+            logging.info("✓ Accepted T&C overlay")
+            time.sleep(WAIT_AFTER)
+        except Exception:
+            pass
 
-    logging.info(f"   debug: found '{IN_STOCK_MARKER}'? {has_add}, "
-                 f"found '{OUT_OF_STOCK_MARKER}'? {has_notify}")
+        # click the "Single Box" variant if it exists
+        try:
+            variants = driver.find_elements(
+                By.XPATH,
+                "//button[contains(normalize-space(.),'Single Box')]"
+            )
+            if variants:
+                variants[0].click()
+                logging.info("✓ Selected Single Box variant")
+                time.sleep(WAIT_AFTER)
+        except Exception as e:
+            logging.warning(f"Variant click failed: {e}")
 
-    in_stock = False
-    if has_add and not has_notify:
-        in_stock = True
-    elif has_add and has_notify:
-        # both present: page may include both in different sections; trust in-stock
-        in_stock = True
-    else:
+        # now just get all the <button> tags and look for "add to bag"
         in_stock = False
+        try:
+            buttons = driver.find_elements(By.TAG_NAME, "button")
+            for b in buttons:
+                txt = b.text.strip().lower()
+                if "add to bag" in txt:
+                    in_stock = True
+                    logging.info(f"   debug: matched button text = {b.text!r}")
+                    break
+            logging.info(f"   debug: in_stock={in_stock}")
+        except Exception as e:
+            logging.warning(f"Button scan failed: {e}")
 
-    if in_stock:
-        msg = f"[{datetime.now():%H:%M}] IN STOCK → {url}"
-        logging.info(msg)
-        send_pushover(msg)
-    else:
-        logging.info("   out of stock")
+        # alert or not
+        if in_stock:
+            msg = f"[{datetime.now():%H:%M}] IN STOCK → {url}"
+            logging.info(msg)
+            send_pushover(msg)
+        else:
+            logging.info("   out of stock")
+
+    except Exception:
+        logging.exception(f"Error on {url}")
+    finally:
+        driver.quit()
+        logging.info(f"← END   {url}")
 
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 def main():
@@ -103,7 +129,7 @@ def main():
         return
 
     start_health_server()
-    # align to next interval boundary
+    # align to next minute
     time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
 
     while True:
@@ -113,5 +139,5 @@ def main():
         logging.info("✅ Cycle END")
         time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
