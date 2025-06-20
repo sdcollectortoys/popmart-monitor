@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-import os
-import time
-import threading
-import logging
+import os, time, threading, logging
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -14,16 +11,16 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.support.ui import WebDriverWait
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-PORT          = int(os.getenv("PORT", "8000"))
-PUSH_KEY      = os.getenv("PUSHOVER_USER_KEY")
-PUSH_TOKEN    = os.getenv("PUSHOVER_API_TOKEN")
-PRODUCT_URLS  = [u.strip() for u in os.getenv("PRODUCT_URLS","").split(",") if u.strip()]
+PORT           = int(os.getenv("PORT", "8000"))
+PUSH_KEY       = os.getenv("PUSHOVER_USER_KEY")
+PUSH_TOKEN     = os.getenv("PUSHOVER_API_TOKEN")
+PRODUCT_URLS   = [u.strip() for u in os.getenv("PRODUCT_URLS","").split(",") if u.strip()]
 
-FALLBACK_TEXT = "add to bag"
-CHECK_INTERVAL= int(os.getenv("CHECK_INTERVAL","60"))
-PAGE_TIMEOUT  = int(os.getenv("PAGE_TIMEOUT","15"))
-WAIT_BEFORE   = 5   # seconds to let Next.js hydrate
-SCRIPT_TIMEOUT= 5   # seconds max for execute_script
+FALLBACK_TEXT  = "add to bag"
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL","60"))
+PAGE_TIMEOUT   = int(os.getenv("PAGE_TIMEOUT","15"))
+WAIT_BEFORE    = 5   # seconds to let Next.js hydrate
+SCRIPT_TIMEOUT = 5   # max seconds for any execute_script call
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -35,8 +32,8 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200); self.end_headers()
 
 def start_health_server():
-    srv = HTTPServer(("", PORT), HealthHandler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    server = HTTPServer(("", PORT), HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     logging.info(f"Health check listening on port {PORT}")
 
 # ─── PUSHOVER ──────────────────────────────────────────────────────────────────
@@ -55,10 +52,11 @@ def send_pushover(msg: str):
     except Exception as e:
         logging.error("Pushover error: %s", e)
 
-# ─── SINGLE CHECK ──────────────────────────────────────────────────────────────
+# ─── STOCK CHECK ───────────────────────────────────────────────────────────────
 def check_stock(url: str):
     logging.info("🚨 DEBUG MODE: check_stock() invoked")
 
+    # set up headless Chrome
     opts = Options()
     for flag in ("--headless","--no-sandbox","--disable-dev-shm-usage"):
         opts.add_argument(flag)
@@ -76,7 +74,7 @@ def check_stock(url: str):
         except TimeoutException:
             logging.warning("⚠️ Page-load timeout; continuing anyway")
 
-        # wait for Next.js JSON blob
+        # allow Next.js hydration
         try:
             WebDriverWait(driver, WAIT_BEFORE).until(
                 lambda d: d.execute_script("return !!window.__NEXT_DATA__")
@@ -84,35 +82,37 @@ def check_stock(url: str):
         except TimeoutException:
             logging.warning("⚠️ __NEXT_DATA__ not present in time")
 
-        # ─── PRIMARY: read Next.js JSON ───────────────────────────────────────────
+        # ─── PRIMARY: read soldOut boolean ─────────────────────────────────────────
         in_stock = False
         try:
-            prod = driver.execute_script(
+            sold_out = driver.execute_script(
                 "return window.__NEXT_DATA__.props.pageProps.product"
+                ".skuInfos[0].soldOut"
             )
-            sold_out = prod.get("skuInfos", [{}])[0].get("soldOut", True)
             in_stock = not sold_out
             logging.info(f"   debug JSON soldOut={sold_out}, inStock={in_stock}")
         except Exception as e:
-            logging.warning(f"JSON lookup failed: {e}")
+            logging.warning(f"JSON soldOut lookup failed: {e}")
 
-        # ─── FALLBACK: JS text scan ────────────────────────────────────────
+        # ─── FALLBACK: scan only <button> text ─────────────────────────────────────
         if not in_stock:
             try:
                 count = driver.execute_script(f"""
-                    return Array.from(document.querySelectorAll('*'))
+                    return Array.from(document.querySelectorAll('button'))
                       .filter(el => {{
-                        const t = (el.textContent||"").replace(/\\u00A0/g,' ').toLowerCase();
+                        const t = (el.textContent||"")
+                          .replace(/\\u00A0/g,' ')
+                          .toLowerCase();
                         return t.includes("{FALLBACK_TEXT}");
                       }})
                       .length;
                 """)
-                logging.info(f"   debug JS fallback found {count} elements containing '{FALLBACK_TEXT}'")
+                logging.info(f"   debug JS fallback found {count} button(s) with '{FALLBACK_TEXT}'")
                 in_stock = (count > 0)
             except Exception as e:
                 logging.warning(f"JS fallback scan failed: {e}")
 
-        # ─── ALERT DECISION ───────────────────────────────────────────
+        # ─── ALERT DECISION ─────────────────────────────────────────────────────
         if in_stock:
             msg = f"[{datetime.now():%H:%M}] IN STOCK → {url}"
             logging.info(msg)
@@ -137,8 +137,8 @@ def main():
 
     while True:
         logging.info("🔄 Cycle START")
-        for u in PRODUCT_URLS:
-            check_stock(u)
+        for link in PRODUCT_URLS:
+            check_stock(link)
         logging.info("✅ Cycle END")
         time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
 
