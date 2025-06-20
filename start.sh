@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -e
+
 while true; do
   echo "▶️  Starting monitor.py at $(date)"
   python -u monitor.py
