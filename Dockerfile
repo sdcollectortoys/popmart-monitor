@@ -19,8 +19,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY monitor.py start.sh ./
 
-# Normalize line endings and make start.sh executable
+# Normalize line endings & make start.sh executable
 RUN sed -i 's/\r$//' start.sh && chmod +x start.sh
 
-# Use bash to launch
+# Launch
 CMD ["bash", "start.sh"]
