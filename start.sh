@@ -1,4 +1,3 @@
-# start.sh  (LF line endings)
 #!/usr/bin/env bash
 set -e
 

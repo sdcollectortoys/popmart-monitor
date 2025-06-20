@@ -1,4 +1,3 @@
-# monitor.py
 #!/usr/bin/env python3
 import os, time, threading, logging
 from datetime import datetime
@@ -10,15 +9,17 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-PORT         = int(os.getenv("PORT", "8000"))
-PUSH_KEY     = os.getenv("PUSHOVER_USER_KEY")
-PUSH_TOKEN   = os.getenv("PUSHOVER_API_TOKEN")
-PRODUCT_URLS = [u.strip() for u in os.getenv("PRODUCT_URLS","").split(",") if u.strip()]
+PORT          = int(os.getenv("PORT", "8000"))
+PUSH_KEY      = os.getenv("PUSHOVER_USER_KEY")
+PUSH_TOKEN    = os.getenv("PUSHOVER_API_TOKEN")
+PRODUCT_URLS  = [u.strip() for u in os.getenv("PRODUCT_URLS","").split(",") if u.strip()]
 
-# always use this default XPath
-STOCK_SELECTOR = (
+# Fallback XPath (in case JSON lookup fails)
+XPATH_FALLBACK = (
     "//*[contains(translate(normalize-space(.),"
     " 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
     " 'add to bag')]"
@@ -26,7 +27,7 @@ STOCK_SELECTOR = (
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL","60"))
 PAGE_TIMEOUT   = int(os.getenv("PAGE_TIMEOUT","15"))
-WAIT_BEFORE    = 3
+WAIT_BEFORE    = 2   # give Next.js a moment to hydrate
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -45,12 +46,12 @@ def start_health_server():
 # ─── PUSHOVER ──────────────────────────────────────────────────────────────────
 def send_pushover(msg: str):
     if not (PUSH_KEY and PUSH_TOKEN):
-        logging.warning("Missing Pushover creds; skipping alert")
+        logging.warning("Missing Pushover creds; skipping")
         return
     try:
         r = requests.post(
             "https://api.pushover.net/1/messages.json",
-            data={"token":PUSH_TOKEN,"user":PUSH_KEY,"message":msg},
+            data={"token":PUSH_TOKEN, "user":PUSH_KEY, "message":msg},
             timeout=10
         )
         r.raise_for_status()
@@ -58,17 +59,15 @@ def send_pushover(msg: str):
     except Exception as e:
         logging.error("Pushover error: %s", e)
 
-# ─── SINGLE CHECK ──────────────────────────────────────────────────────────────
+# ─── STOCK CHECK ───────────────────────────────────────────────────────────────
 def check_stock(url: str):
-    # confirm this code actually ran
     logging.info("🚨 DEBUG MODE: check_stock() invoked")
-    logging.info(f"🚨 DEBUG MODE: STOCK_SELECTOR = {STOCK_SELECTOR!r}")
 
+    # set up headless Chrome
     opts = Options()
     for flag in ("--headless","--no-sandbox","--disable-dev-shm-usage"):
         opts.add_argument(flag)
     opts.page_load_strategy = "eager"
-
     service = Service(os.getenv("CHROMEDRIVER_PATH","/usr/bin/chromedriver"))
     driver  = webdriver.Chrome(service=service, options=opts)
     driver.set_page_load_timeout(PAGE_TIMEOUT)
@@ -78,59 +77,36 @@ def check_stock(url: str):
         try:
             driver.get(url)
         except TimeoutException:
-            logging.warning("⚠️ Page‐load timeout; continuing")
+            logging.warning("⚠️ Page-load timeout; continuing anyway")
 
-        time.sleep(WAIT_BEFORE)
+        # wait for Next.js data to hydrate
+        WebDriverWait(driver, WAIT_BEFORE).until(
+            lambda d: d.execute_script("return !!window.__NEXT_DATA__")
+        )
 
-        # safe overlay-click
-        try:
-            ov = driver.find_elements(By.XPATH, "//div[contains(@class,'policy_acceptBtn')]")
-            if ov:
-                ov[0].click()
-                logging.info("✓ Accepted overlay")
-                time.sleep(1)
-        except Exception as e:
-            logging.warning(f"Overlay-click failed, continuing: {e}")
+        # retrieve the JSON blob
+        data = driver.execute_script("return window.__NEXT_DATA__.props.pageProps.product")
+        # most Next pages have skuInfos[0].soldOut boolean
+        sold_out = data.get("skuInfos", [{}])[0].get("soldOut", True)
+        in_stock = not sold_out
 
-        # ── DEBUG #1: raw HTML check ───────────────────────────────────
-        raw_html = ""
-        try:
-            raw_html = driver.page_source.replace("\u00A0"," ")
-        except (TimeoutException, WebDriverException) as e:
-            logging.warning(f"raw page_source timed out or failed: {e}")
-            try:
-                # fallback via JS
-                raw_html = driver.execute_script(
-                    "return document.documentElement.outerHTML"
-                ).replace("\u00A0"," ")
-                logging.info("   debug1: fallback outerHTML succeeded")
-            except Exception as je:
-                logging.warning(f"fallback outerHTML also failed: {je}")
+        logging.info(f"   debug JSON soldOut={sold_out}, inStock={in_stock}")
 
-        low = raw_html.lower()
-        found_sub = "add to bag" in low
-        logging.info(f"   debug1: raw HTML contains 'add to bag'? {found_sub}")
-        if found_sub:
-            idx = low.find("add to bag")
-            snippet = raw_html[max(0, idx-80):idx+80].replace("\n"," ")
-            logging.info(f"   debug1 snippet: …{snippet}…")
+        # FALLBACK: if JSON says soldOut but XPATH_FALLBACK finds add-to-bag, override
+        if not in_stock:
+            if driver.find_elements(By.XPATH, XPATH_FALLBACK):
+                logging.info("   debug: fallback XPath found add-to-bag → overriding JSON")
+                in_stock = True
 
-        # ── DEBUG #2: XPath matches ───────────────────────────────────
-        matches = driver.find_elements(By.XPATH, STOCK_SELECTOR)
-        logging.info(f"   debug2: STOCK_SELECTOR matched {len(matches)} element(s)")
-        for el in matches:
-            logging.info(f"      → tag={el.tag_name!r}, text={el.text!r}")
-
-        # ── ALERT DECISION ───────────────────────────────────────────
-        if matches:
+        if in_stock:
             msg = f"[{datetime.now():%H:%M}] IN STOCK → {url}"
             logging.info(msg)
             send_pushover(msg)
         else:
             logging.info("   out of stock")
 
-    except Exception:
-        logging.exception(f"Error on {url}")
+    except Exception as e:
+        logging.exception(f"Error on {url}: {e}")
     finally:
         driver.quit()
         logging.info(f"← END   {url}")
@@ -142,6 +118,7 @@ def main():
         return
 
     start_health_server()
+    # align to next minute boundary
     time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
 
     while True:
