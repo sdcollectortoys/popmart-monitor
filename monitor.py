@@ -10,31 +10,22 @@ import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 PORT          = int(os.getenv("PORT", "8000"))
 PUSH_KEY      = os.getenv("PUSHOVER_USER_KEY")
 PUSH_TOKEN    = os.getenv("PUSHOVER_API_TOKEN")
-PRODUCT_URLS  = [
-    u.strip()
-    for u in os.getenv("PRODUCT_URLS", "").split(",")
-    if u.strip()
-]
+PRODUCT_URLS  = [u.strip() for u in os.getenv("PRODUCT_URLS","").split(",") if u.strip()]
 
-# If Next.js JSON fails, we’ll fallback to scanning textContent for this:
 FALLBACK_TEXT = "add to bag"
+CHECK_INTERVAL= int(os.getenv("CHECK_INTERVAL","60"))
+PAGE_TIMEOUT  = int(os.getenv("PAGE_TIMEOUT","15"))
+WAIT_BEFORE   = 5   # seconds to let Next.js hydrate
+SCRIPT_TIMEOUT= 5   # seconds max for execute_script
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL","60"))
-PAGE_TIMEOUT   = int(os.getenv("PAGE_TIMEOUT","15"))
-WAIT_BEFORE    = 3  # seconds to let Next.js hydrate
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # ─── HEALTH CHECK ──────────────────────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
@@ -64,18 +55,19 @@ def send_pushover(msg: str):
     except Exception as e:
         logging.error("Pushover error: %s", e)
 
-# ─── STOCK CHECK ───────────────────────────────────────────────────────────────
+# ─── SINGLE CHECK ──────────────────────────────────────────────────────────────
 def check_stock(url: str):
     logging.info("🚨 DEBUG MODE: check_stock() invoked")
 
-    # set up headless Chrome
     opts = Options()
     for flag in ("--headless","--no-sandbox","--disable-dev-shm-usage"):
         opts.add_argument(flag)
     opts.page_load_strategy = "eager"
+
     service = Service(os.getenv("CHROMEDRIVER_PATH","/usr/bin/chromedriver"))
     driver  = webdriver.Chrome(service=service, options=opts)
     driver.set_page_load_timeout(PAGE_TIMEOUT)
+    driver.set_script_timeout(SCRIPT_TIMEOUT)
 
     try:
         logging.info(f"→ START {url}")
@@ -92,7 +84,7 @@ def check_stock(url: str):
         except TimeoutException:
             logging.warning("⚠️ __NEXT_DATA__ not present in time")
 
-        # ─── PRIMARY: read Next.js JSON ────────────────────────────────────────────
+        # ─── PRIMARY: read Next.js JSON ───────────────────────────────────────────
         in_stock = False
         try:
             prod = driver.execute_script(
@@ -104,23 +96,23 @@ def check_stock(url: str):
         except Exception as e:
             logging.warning(f"JSON lookup failed: {e}")
 
-        # ─── FALLBACK: scan textContent via JS ────────────────────────────────────
+        # ─── FALLBACK: JS text scan ────────────────────────────────────────
         if not in_stock:
             try:
                 count = driver.execute_script(f"""
                     return Array.from(document.querySelectorAll('*'))
-                      .reduce((sum, el) => 
-                        sum + (el.textContent||"")
-                          .toLowerCase()
-                          .includes("{FALLBACK_TEXT}")|0
-                      , 0);
+                      .filter(el => {{
+                        const t = (el.textContent||"").replace(/\\u00A0/g,' ').toLowerCase();
+                        return t.includes("{FALLBACK_TEXT}");
+                      }})
+                      .length;
                 """)
                 logging.info(f"   debug JS fallback found {count} elements containing '{FALLBACK_TEXT}'")
                 in_stock = (count > 0)
             except Exception as e:
                 logging.warning(f"JS fallback scan failed: {e}")
 
-        # ─── ALERT DECISION ─────────────────────────────────────────────────────
+        # ─── ALERT DECISION ───────────────────────────────────────────
         if in_stock:
             msg = f"[{datetime.now():%H:%M}] IN STOCK → {url}"
             logging.info(msg)
@@ -141,7 +133,6 @@ def main():
         return
 
     start_health_server()
-    # align to top of the next minute
     time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
 
     while True:
