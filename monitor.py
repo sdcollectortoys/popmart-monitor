@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 import os
 import time
-import threading
 import logging
-import json
+import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
-from bs4 import BeautifulSoup
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-PORT            = int(os.getenv("PORT", "8000"))
-PUSH_KEY        = os.getenv("PUSHOVER_USER_KEY")
-PUSH_TOKEN      = os.getenv("PUSHOVER_API_TOKEN")
-PRODUCT_URLS    = [u.strip() for u in os.getenv("PRODUCT_URLS","").split(",") if u.strip()]
-CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL","60"))
-REQUEST_TIMEOUT = 10  # seconds for HTTP GET
+PORT             = int(os.getenv("PORT", "8000"))
+PUSH_KEY         = os.getenv("PUSHOVER_USER_KEY")
+PUSH_TOKEN       = os.getenv("PUSHOVER_API_TOKEN")
+PRODUCT_URLS     = [
+    u.strip() for u in os.getenv("PRODUCT_URLS", "").split(",") if u.strip()
+]
+CHECK_INTERVAL   = int(os.getenv("CHECK_INTERVAL", "60"))
+REQUEST_TIMEOUT  = 10  # seconds
+
+# Substrings to look for
+IN_STOCK_MARKER    = "add to bag"
+OUT_OF_STOCK_MARKER = "notify me when available"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; stock-monitor/1.0)"
@@ -30,9 +34,12 @@ logging.basicConfig(
 # ─── HEALTH CHECK ──────────────────────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
     def do_HEAD(self):
-        self.send_response(200); self.end_headers()
+        self.send_response(200)
+        self.end_headers()
 
 def start_health_server():
     server = HTTPServer(("", PORT), HealthHandler)
@@ -47,7 +54,7 @@ def send_pushover(msg: str):
     try:
         resp = requests.post(
             "https://api.pushover.net/1/messages.json",
-            data={"token":PUSH_TOKEN, "user":PUSH_KEY, "message": msg},
+            data={"token": PUSH_TOKEN, "user": PUSH_KEY, "message": msg},
             timeout=REQUEST_TIMEOUT
         )
         resp.raise_for_status()
@@ -55,7 +62,7 @@ def send_pushover(msg: str):
     except Exception as e:
         logging.error("Pushover error: %s", e)
 
-# ─── SINGLE CHECK ──────────────────────────────────────────────────────────────
+# ─── STOCK CHECK ───────────────────────────────────────────────────────────────
 def check_stock(url: str):
     logging.info(f"→ START {url}")
     try:
@@ -65,45 +72,23 @@ def check_stock(url: str):
         logging.error("HTTP error fetching %s: %s", url, e)
         return
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    script = soup.find("script", id="__NEXT_DATA__", type="application/json")
-    if not script or not script.string:
-        logging.error("   no __NEXT_DATA__ JSON on page")
-        return
+    txt = r.text.lower()
 
-    # parse JSON
-    try:
-        data = json.loads(script.string)
-    except Exception as e:
-        logging.error("   JSON loads error: %s", e)
-        return
+    has_add    = IN_STOCK_MARKER in txt
+    has_notify = OUT_OF_STOCK_MARKER in txt
 
-    # dump structure
-    top_keys   = list(data.keys())
-    props      = data.get("props", {})
-    props_keys = list(props.keys())
-    pageProps  = props.get("pageProps", {})
-    pp_keys    = list(pageProps.keys())
+    logging.info(f"   debug: found '{IN_STOCK_MARKER}'? {has_add}, "
+                 f"found '{OUT_OF_STOCK_MARKER}'? {has_notify}")
 
-    logging.info(f"   debug JSON top keys: {top_keys}")
-    logging.info(f"   debug JSON props keys: {props_keys}")
-    logging.info(f"   debug JSON pageProps keys: {pp_keys}")
+    in_stock = False
+    if has_add and not has_notify:
+        in_stock = True
+    elif has_add and has_notify:
+        # both present: page may include both in different sections; trust in-stock
+        in_stock = True
+    else:
+        in_stock = False
 
-    # try to find the product blob
-    if "product" not in pageProps:
-        logging.error("   'product' not in pageProps; cannot determine stock")
-        return
-
-    try:
-        prod     = pageProps["product"]
-        sold_out = prod["skuInfos"][0].get("soldOut", True)
-        in_stock = not sold_out
-        logging.info(f"   debug JSON soldOut={sold_out}, inStock={in_stock}")
-    except Exception as e:
-        logging.error("   JSON parse error: %s", e)
-        return
-
-    # final alert logic
     if in_stock:
         msg = f"[{datetime.now():%H:%M}] IN STOCK → {url}"
         logging.info(msg)
@@ -118,6 +103,7 @@ def main():
         return
 
     start_health_server()
+    # align to next interval boundary
     time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
 
     while True:
