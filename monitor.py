@@ -1,108 +1,125 @@
 #!/usr/bin/env python3
 import os
-import sys
 import time
 import logging
 import requests
+import threading
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
-# ─── Configuration ─────────────────────────────────────────────────────────────
-# Now reading PRODUCT_URLS, not URLS
-raw = os.getenv("PRODUCT_URLS", "").strip()
-URLS = [u.strip() for u in raw.split(",") if u.strip()]
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+PORT            = int(os.getenv("PORT", "8000"))
+PRODUCT_URLS    = [u.strip() for u in os.getenv("PRODUCT_URLS", "").split(",") if u.strip()]
+CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL", "60"))
+PUSHOVER_TOKEN  = os.getenv("PUSHOVER_TOKEN")
+PUSHOVER_USER   = os.getenv("PUSHOVER_USER")
 
-PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN")
-PUSHOVER_USER  = os.getenv("PUSHOVER_USER")
-
-# ─── Logging ────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s %(levelname)7s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)
 
-# ─── Push helper ────────────────────────────────────────────────────────────────
-def send_push(title: str, message: str):
+# ─── HEALTH CHECK ──────────────────────────────────────────────────────────────
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+    def do_HEAD(self):
+        self.send_response(200); self.end_headers()
+
+def start_health_server():
+    srv = HTTPServer(("", PORT), HealthHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    logger.info(f"Health check listening on port {PORT}")
+
+# ─── PUSHOVER ──────────────────────────────────────────────────────────────────
+def send_push(msg: str):
     if not (PUSHOVER_TOKEN and PUSHOVER_USER):
-        logger.warning("Push credentials not set; skipping alert.")
+        logger.warning("Missing push credentials; skipping alert")
         return
-    resp = requests.post("https://api.pushover.net/1/messages.json", data={
-        "token":  PUSHOVER_TOKEN,
-        "user":   PUSHOVER_USER,
-        "title":  title,
-        "message": message
-    })
-    if resp.status_code == 200:
+    try:
+        r = requests.post("https://api.pushover.net/1/messages.json", data={
+            "token":   PUSHOVER_TOKEN,
+            "user":    PUSHOVER_USER,
+            "message": msg
+        }, timeout=10)
+        r.raise_for_status()
         logger.info("✔️ Pushover sent")
-    else:
-        logger.error(f"✖️ Pushover failed ({resp.status_code}): {resp.text}")
+    except Exception as e:
+        logger.error("Pushover error: %s", e)
 
-# ─── Browser setup ──────────────────────────────────────────────────────────────
+# ─── BROWSER SETUP ─────────────────────────────────────────────────────────────
 def make_driver():
     opts = Options()
-    opts.add_argument("--headless")
+    opts.headless = True
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     driver = webdriver.Chrome(options=opts)
     driver.set_page_load_timeout(30)
     return driver
 
-# ─── Single-URL check ───────────────────────────────────────────────────────────
+# ─── CHECK ONE PRODUCT ─────────────────────────────────────────────────────────
 def check_stock(driver, url: str):
     logger.info(f"→ START {url}")
     try:
         driver.get(url)
-    except Exception as e:
+    except (TimeoutException, WebDriverException) as e:
         logger.warning(f"⚠️ page-load failed: {e}")
 
-    # 1) click the “Single box” option (if present)
+    # 1) Click the “Single box” wrapper (if present)
     try:
         variant_xpath = (
-            "//div[contains(@class,'index_sizeInfoTitle') "
-            "and normalize-space(text())='Single box']"
+            "//div[contains(@class,'index_sizeInfoItem') "
+            "and .//div[normalize-space(text())='Single box']]"
         )
-        el = driver.find_element(By.XPATH, variant_xpath)
-        el.click()
-        logger.info("Clicked Single box")
+        wrapper = driver.find_element(By.XPATH, variant_xpath)
+        wrapper.click()
+        logger.info("   clicked Single box")
         time.sleep(1)
     except Exception as e:
-        logger.debug(f"No variant click: {e}")
+        logger.debug(f"   variant click skipped: {e}")
 
-    # 2) look for the exact ADD TO BAG button
+    # 2) Look *only* for the exact “ADD TO BAG” button
     try:
-        stock_xpath = "//div[normalize-space(text())='ADD TO BAG']"
-        found = driver.find_elements(By.XPATH, stock_xpath)
-        if found:
-            ts = time.strftime("%H:%M")
-            logger.info(f"[{ts}] 🚨 IN STOCK → {url}")
-            send_push("Popmart Restock!", f"{url} is IN STOCK at {ts}")
+        stock_xpath = (
+            "//div[contains(@class,'index_usBtn') "
+            "and contains(normalize-space(.),'ADD TO BAG')]"
+        )
+        buttons = driver.find_elements(By.XPATH, stock_xpath)
+        logger.info(f"   debug: found {len(buttons)} matching button(s)")
+        if buttons:
+            ts = datetime.now().strftime("%H:%M")
+            msg = f"[{ts}] 🚨 IN STOCK → {url}"
+            logger.info(msg)
+            send_push(msg)
         else:
-            logger.info("out of stock")
+            logger.info("   out of stock")
     except Exception as e:
-        logger.error(f"Button scan failed: {e}")
+        logger.error(f"   button scan failed: {e}")
 
     logger.info(f"← END   {url}")
 
-# ─── Main loop ─────────────────────────────────────────────────────────────────
+# ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 def main():
-    if not URLS:
-        logger.error("No URLs provided. Set the PRODUCT_URLS env var.")
-        sys.exit(1)
+    if not PRODUCT_URLS:
+        logger.error("No PRODUCT_URLS set in env; aborting")
+        return
 
+    start_health_server()
     driver = make_driver()
-    logger.info("Health check OK — headless Chrome ready")
+
+    # align to the minute
+    time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
 
     while True:
         logger.info("🔄 Cycle START")
-        for u in URLS:
-            check_stock(driver, u)
+        for url in PRODUCT_URLS:
+            check_stock(driver, url)
         logger.info("✅ Cycle END")
-        # wait until top of next minute
-        sleep_secs = 60 - (time.time() % 60)
-        time.sleep(sleep_secs)
+        # sleep until next cycle
+        time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
 
 if __name__ == "__main__":
     main()
