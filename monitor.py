@@ -4,7 +4,6 @@ import time
 import logging
 import threading
 import json
-from urllib.parse import urlparse
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -15,9 +14,9 @@ from bs4 import BeautifulSoup
 PORT            = int(os.getenv("PORT", "8000"))
 PUSH_KEY        = os.getenv("PUSHOVER_USER_KEY")
 PUSH_TOKEN      = os.getenv("PUSHOVER_API_TOKEN")
-PRODUCT_URLS    = [u.strip() for u in os.getenv("PRODUCT_URLS","").split(",") if u.strip()]
-CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL","60"))
-REQUEST_TIMEOUT = 10  # seconds
+PRODUCT_URLS    = [u.strip() for u in os.getenv("PRODUCT_URLS", "").split(",") if u.strip()]
+CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL", "60"))
+REQUEST_TIMEOUT = 10  # seconds per HTTP request
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; stock-monitor/1.0)"
@@ -28,9 +27,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 # ─── HEALTH CHECK ──────────────────────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
     def do_HEAD(self):
-        self.send_response(200); self.end_headers()
+        self.send_response(200)
+        self.end_headers()
 
 def start_health_server():
     httpd = HTTPServer(("", PORT), HealthHandler)
@@ -43,12 +45,12 @@ def send_pushover(msg: str):
         logging.warning("Missing Pushover credentials; skipping alert")
         return
     try:
-        resp = requests.post(
+        r = requests.post(
             "https://api.pushover.net/1/messages.json",
             data={"token": PUSH_TOKEN, "user": PUSH_KEY, "message": msg},
             timeout=REQUEST_TIMEOUT
         )
-        resp.raise_for_status()
+        r.raise_for_status()
         logging.info("✔️ Pushover sent")
     except Exception as e:
         logging.error("Pushover error: %s", e)
@@ -57,7 +59,7 @@ def send_pushover(msg: str):
 def check_stock(url: str):
     logging.info(f"→ START {url}")
 
-    # 1) Fetch initial HTML to extract __NEXT_DATA__
+    # 1) Fetch initial HTML for __NEXT_DATA__
     try:
         r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
@@ -68,21 +70,22 @@ def check_stock(url: str):
     soup = BeautifulSoup(r.text, "html.parser")
     script = soup.find("script", id="__NEXT_DATA__", type="application/json")
     if not script or not script.string:
-        logging.error("   no __NEXT_DATA__ JSON on page")
+        logging.error("   no __NEXT_DATA__ on page")
         return
 
-    # 2) Parse for buildId and route
+    # 2) Parse __NEXT_DATA__ for buildId + exact page route
     try:
         data     = json.loads(script.string)
         build_id = data["buildId"]
-        # compute JSON URL based on host + path
-        parsed   = urlparse(url)
-        host     = f"{parsed.scheme}://{parsed.netloc}"
-        suffix   = parsed.path.lstrip("/")  # e.g. "us/products/878/..."
-        json_url = f"{host}/_next/data/{build_id}/{suffix}.json"
+        route    = data.get("page", "")
+        if not route:
+            logging.error("   missing `page` in __NEXT_DATA__")
+            return
+        # build JSON URL
+        json_url = f"https://{soup.find('meta', {'property': 'og:url'})['content'].split('//')[1]}/_next/data/{build_id}{route}.json"
         logging.info(f"   debug: fetching JSON at {json_url}")
     except Exception as e:
-        logging.error("   failed to build JSON URL: %s", e)
+        logging.error("   parsing __NEXT_DATA__ failed: %s", e)
         return
 
     # 3) Fetch the data JSON
@@ -94,7 +97,7 @@ def check_stock(url: str):
         logging.error("   error fetching JSON %s: %s", json_url, e)
         return
 
-    # 4) Extract product.skuInfos[0].soldOut
+    # 4) Extract soldOut flag
     try:
         prod      = payload["pageProps"]["product"]
         sku_infos = prod.get("skuInfos", [])
@@ -102,10 +105,10 @@ def check_stock(url: str):
         in_stock  = not sold_out
         logging.info(f"   debug JSON soldOut={sold_out}, inStock={in_stock}")
     except Exception as e:
-        logging.error("   JSON parse error: %s", e)
+        logging.error("   extracting soldOut failed: %s", e)
         return
 
-    # 5) Alert if in stock
+    # 5) Alert
     if in_stock:
         msg = f"[{datetime.now():%H:%M}] IN STOCK → {url}"
         logging.info(msg)
@@ -120,9 +123,7 @@ def main():
         return
 
     start_health_server()
-    # align to the next interval
     time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
-
     while True:
         logging.info("🔄 Cycle START")
         for u in PRODUCT_URLS:
