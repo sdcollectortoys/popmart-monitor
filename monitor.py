@@ -18,12 +18,12 @@ def start_health_server(port=10000):
     return srv
 
 # ---- Pushover alert ----
-PUSH_APP_TOKEN = os.environ["PUSHOVER_APP_TOKEN"]
-PUSH_USER_KEY  = os.environ["PUSHOVER_USER_KEY"]
+PUSHOVER_API_TOKEN = os.environ["PUSHOVER_API_TOKEN"]
+PUSHOVER_USER_KEY  = os.environ["PUSHOVER_USER_KEYY"]
 def send_pushover(msg: str):
     r = requests.post(
         "https://api.pushover.net/1/messages.json",
-        data={"token": PUSH_APP_TOKEN, "user": PUSH_USER_KEY, "message": msg},
+        data={"token": PUSHOVER_API_TOKEN, "user": PUSHOVER_USER_KEY, "message": msg},
         timeout=10
     )
     r.raise_for_status()
