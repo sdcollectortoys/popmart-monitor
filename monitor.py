@@ -4,8 +4,8 @@ import time
 import logging
 import threading
 import json
-from urllib.parse import urlparse
 from datetime import datetime
+from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
@@ -17,7 +17,7 @@ PUSH_KEY        = os.getenv("PUSHOVER_USER_KEY")
 PUSH_TOKEN      = os.getenv("PUSHOVER_API_TOKEN")
 PRODUCT_URLS    = [u.strip() for u in os.getenv("PRODUCT_URLS","").split(",") if u.strip()]
 CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL","60"))
-REQUEST_TIMEOUT = 10  # seconds
+REQUEST_TIMEOUT = 10  # seconds per HTTP request
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; stock-monitor/1.0)"}
 
@@ -26,9 +26,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 # ─── HEALTH CHECK ──────────────────────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
     def do_HEAD(self):
-        self.send_response(200); self.end_headers()
+        self.send_response(200)
+        self.end_headers()
 
 def start_health_server():
     httpd = HTTPServer(("", PORT), HealthHandler)
@@ -41,12 +44,12 @@ def send_pushover(msg: str):
         logging.warning("Missing Pushover credentials; skipping alert")
         return
     try:
-        r = requests.post(
+        resp = requests.post(
             "https://api.pushover.net/1/messages.json",
             data={"token": PUSH_TOKEN, "user": PUSH_KEY, "message": msg},
             timeout=REQUEST_TIMEOUT
         )
-        r.raise_for_status()
+        resp.raise_for_status()
         logging.info("✔️ Pushover sent")
     except Exception as e:
         logging.error("Pushover error: %s", e)
@@ -55,7 +58,7 @@ def send_pushover(msg: str):
 def check_stock(url: str):
     logging.info(f"→ START {url}")
 
-    # 1) get initial HTML
+    # 1) Fetch initial HTML for __NEXT_DATA__
     try:
         r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
@@ -69,31 +72,39 @@ def check_stock(url: str):
         logging.error("   no __NEXT_DATA__ on page")
         return
 
-    # 2) parse buildId and page route
+    # 2) Parse __NEXT_DATA__ to get buildId and reconstruct route
     try:
         d = json.loads(script.string)
         build_id = d["buildId"]
-        route    = d.get("page", "")
-        if not route:
-            logging.error("   missing `page` in __NEXT_DATA__")
+
+        query = d.get("query", {})
+        if "queryParams" in query and isinstance(query["queryParams"], list):
+            segments = query["queryParams"]
+        elif "id" in query and "slug" in query:
+            segments = ["us", "products", query["id"], query["slug"]]
+        else:
+            logging.error("   cannot reconstruct route from __NEXT_DATA__.query")
             return
+
+        route = "/" + "/".join(segments)  # e.g. "/us/products/878/..."
     except Exception as e:
         logging.error("   parsing __NEXT_DATA__ failed: %s", e)
         return
 
     parsed = urlparse(url)
     host   = f"{parsed.scheme}://{parsed.netloc}"
-    # candidate JSON URLs
+
+    # 3) Try the dynamic and static JSON endpoints
     candidates = [
         f"{host}/_next/data/{build_id}{route}.json",
         f"{host}{route}.json"
     ]
-
     payload = None
-    for candidate in candidates:
-        logging.info(f"   debug: trying JSON at {candidate}")
+
+    for endpoint in candidates:
+        logging.info(f"   debug: trying JSON at {endpoint}")
         try:
-            jr = requests.get(candidate, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            jr = requests.get(endpoint, headers=HEADERS, timeout=REQUEST_TIMEOUT)
             if jr.status_code != 200:
                 continue
             payload = jr.json()
@@ -105,7 +116,7 @@ def check_stock(url: str):
         logging.error("   all JSON endpoints failed")
         return
 
-    # 3) extract soldOut
+    # 4) Extract soldOut flag
     try:
         prod      = payload["pageProps"]["product"]
         sku_infos = prod.get("skuInfos", [])
@@ -116,7 +127,7 @@ def check_stock(url: str):
         logging.error("   JSON parse error: %s", e)
         return
 
-    # 4) alert
+    # 5) Send alert if in stock
     if in_stock:
         msg = f"[{datetime.now():%H:%M}] IN STOCK → {url}"
         logging.info(msg)
@@ -131,6 +142,7 @@ def main():
         return
 
     start_health_server()
+    # align to the next interval boundary
     time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
     while True:
         logging.info("🔄 Cycle START")
@@ -139,5 +151,5 @@ def main():
         logging.info("✅ Cycle END")
         time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
