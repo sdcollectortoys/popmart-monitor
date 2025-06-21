@@ -67,10 +67,14 @@ def make_driver():
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-dev-shm-usage")
+    # disable images for speed
     prefs = {"profile.managed_default_content_settings.images": 2}
     opts.add_experimental_option("prefs", prefs)
-    ua = f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
-         f" (KHTML, like Gecko) Chrome/{random.randint(90,114)}.0.5481.100 Safari/537.36"
+    # randomize UA slightly to avoid simple blocks
+    ua = (
+        f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{random.randint(90,114)}.0.5481.100 Safari/537.36"
+    )
     opts.add_argument(f"--user-agent={ua}")
 
     profile = f"/tmp/stockmon-{uuid.uuid4()}"
@@ -80,7 +84,7 @@ def make_driver():
     driver.set_page_load_timeout(20)
     return driver
 
-# ---- Overlay acceptance & stock check ----
+# ---- Overlay acceptance ----
 def accept_overlays(driver):
     try:
         btn = WebDriverWait(driver, 5).until(
@@ -96,17 +100,18 @@ def accept_overlays(driver):
     except TimeoutException:
         pass
 
+# ---- Stock check (matches ANY element, case-insensitive) ----
 def check_stock(driver, url: str) -> str:
     driver.get(url)
     accept_overlays(driver)
 
-    # wait for either stock button (case-insensitive)
+    # wait for either "add to bag" or "notify me when available" to appear
     xpath_any = (
-        "//button["
+        "//*["
         "contains(translate(normalize-space(.),"
         " 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
-        " 'abcdefghijklmnopqrstuvwxyz'), 'add to bag') "
-        "or "
+        " 'abcdefghijklmnopqrstuvwxyz'), 'add to bag')"
+        " or "
         "contains(translate(normalize-space(.),"
         " 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
         " 'abcdefghijklmnopqrstuvwxyz'), 'notify me when available')"
@@ -116,15 +121,15 @@ def check_stock(driver, url: str) -> str:
         EC.presence_of_element_located((By.XPATH, xpath_any))
     )
 
-    # now count “Add to Bag” buttons (case-insensitive)
+    # now detect "add to bag" elements
     xpath_in = (
-        "//button[contains(translate(normalize-space(.),"
+        "//*[contains(translate(normalize-space(.),"
         " 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
         " 'abcdefghijklmnopqrstuvwxyz'), 'add to bag')]"
     )
-    in_buttons = driver.find_elements(By.XPATH, xpath_in)
-    print(f"debug: found {len(in_buttons)} add-to-bag button(s)")
-    return "in" if in_buttons else "out"
+    elements = driver.find_elements(By.XPATH, xpath_in)
+    print(f"debug: found {len(elements)} ADD TO BAG element(s)")
+    return "in" if elements else "out"
 
 def sleep_until_top_of_minute():
     now = time.time()
@@ -133,7 +138,7 @@ def sleep_until_top_of_minute():
 
 # ---- Main service ----
 def main():
-    urls = [u.strip() for u in os.environ.get("PRODUCT_URLS","").split(",") if u.strip()]
+    urls = [u.strip() for u in os.environ.get("PRODUCT_URLS", "").split(",") if u.strip()]
     if not urls:
         print("No PRODUCT_URLS configured; exiting.")
         sys.exit(1)
@@ -161,13 +166,13 @@ def main():
         sleep_until_top_of_minute()
         for url in urls:
             state = None
-            for attempt in range(1,4):
+            for attempt in range(1, 4):
                 try:
                     state = check_stock(driver, url)
                     break
                 except WebDriverException as e:
                     print(f"[Attempt {attempt}] error on {url}: {e}", file=sys.stderr)
-                    time.sleep(1 * attempt)
+                    time.sleep(attempt)
             if state is None:
                 print(f"All attempts failed for {url}", file=sys.stderr)
                 continue
