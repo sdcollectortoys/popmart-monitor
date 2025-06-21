@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import sys
 import time
 import logging
 import requests
@@ -19,48 +20,57 @@ CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL", "60"))
 PUSHOVER_TOKEN  = os.getenv("PUSHOVER_TOKEN")
 PUSHOVER_USER   = os.getenv("PUSHOVER_USER")
 
+# ─── LOGGING ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger()
 
 # ─── HEALTH CHECK ──────────────────────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
     def do_HEAD(self):
-        self.send_response(200); self.end_headers()
+        self.send_response(200)
+        self.end_headers()
 
 def start_health_server():
-    srv = HTTPServer(("", PORT), HealthHandler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    server = HTTPServer(("", PORT), HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     logger.info(f"Health check listening on port {PORT}")
 
-# ─── PUSHOVER ──────────────────────────────────────────────────────────────────
+# ─── PUSHOVER ALERT ────────────────────────────────────────────────────────────
 def send_push(msg: str):
     if not (PUSHOVER_TOKEN and PUSHOVER_USER):
         logger.warning("Missing push credentials; skipping alert")
         return
     try:
-        r = requests.post("https://api.pushover.net/1/messages.json", data={
-            "token":   PUSHOVER_TOKEN,
-            "user":    PUSHOVER_USER,
-            "message": msg
-        }, timeout=10)
-        r.raise_for_status()
+        resp = requests.post(
+            "https://api.pushover.net/1/messages.json",
+            data={"token": PUSHOVER_TOKEN, "user": PUSHOVER_USER, "message": msg},
+            timeout=10
+        )
+        resp.raise_for_status()
         logger.info("✔️ Pushover sent")
     except Exception as e:
         logger.error("Pushover error: %s", e)
 
-# ─── BROWSER SETUP ─────────────────────────────────────────────────────────────
+# ─── CHROME DRIVER SETUP ───────────────────────────────────────────────────────
 def make_driver():
     opts = Options()
     opts.headless = True
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-gpu")
+    # use a dedicated user-data-dir so sessions don’t collide
+    opts.add_argument("--user-data-dir=/tmp/chrome-user-data")
+    opts.add_argument("--window-size=1920,1080")
     driver = webdriver.Chrome(options=opts)
     driver.set_page_load_timeout(30)
     return driver
 
-# ─── CHECK ONE PRODUCT ─────────────────────────────────────────────────────────
+# ─── CHECK A SINGLE PRODUCT ────────────────────────────────────────────────────
 def check_stock(driver, url: str):
     logger.info(f"→ START {url}")
     try:
@@ -68,7 +78,7 @@ def check_stock(driver, url: str):
     except (TimeoutException, WebDriverException) as e:
         logger.warning(f"⚠️ page-load failed: {e}")
 
-    # 1) Click the “Single box” wrapper (if present)
+    # 1) Click "Single box" variant if present
     try:
         variant_xpath = (
             "//div[contains(@class,'index_sizeInfoItem') "
@@ -81,11 +91,11 @@ def check_stock(driver, url: str):
     except Exception as e:
         logger.debug(f"   variant click skipped: {e}")
 
-    # 2) Look *only* for the exact “ADD TO BAG” button
+    # 2) Look only for the exact ADD TO BAG button
     try:
         stock_xpath = (
             "//div[contains(@class,'index_usBtn') "
-            "and contains(normalize-space(.),'ADD TO BAG')]"
+            "and normalize-space(text())='ADD TO BAG']"
         )
         buttons = driver.find_elements(By.XPATH, stock_xpath)
         logger.info(f"   debug: found {len(buttons)} matching button(s)")
@@ -105,12 +115,12 @@ def check_stock(driver, url: str):
 def main():
     if not PRODUCT_URLS:
         logger.error("No PRODUCT_URLS set in env; aborting")
-        return
+        sys.exit(1)
 
     start_health_server()
     driver = make_driver()
 
-    # align to the minute
+    # Align to top of the next minute
     time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
 
     while True:
@@ -118,7 +128,6 @@ def main():
         for url in PRODUCT_URLS:
             check_stock(driver, url)
         logger.info("✅ Cycle END")
-        # sleep until next cycle
         time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
 
 if __name__ == "__main__":
