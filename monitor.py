@@ -60,9 +60,6 @@ def check_stock(url: str):
         return
 
     soup = BeautifulSoup(resp.text, "html.parser")
-
-    # Look for the single-box selector and click it—**not** needed: single is default.
-    # Now scan for the exact ADD TO BAG div
     buttons = soup.find_all(
         "div",
         class_=lambda c: c and "index_usBtn" in c,
@@ -88,7 +85,7 @@ def main():
 
     start_health_server()
 
-    # drift-proof sleep until next interval
+    # align to interval
     time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
 
     while True:
