@@ -63,8 +63,6 @@ def make_driver():
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-gpu")
-    # use a dedicated user-data-dir so sessions don’t collide
-    opts.add_argument("--user-data-dir=/tmp/chrome-user-data")
     opts.add_argument("--window-size=1920,1080")
     driver = webdriver.Chrome(options=opts)
     driver.set_page_load_timeout(30)
