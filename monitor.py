@@ -5,7 +5,6 @@ import time
 import logging
 import requests
 import threading
-import tempfile
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -58,11 +57,8 @@ def send_push(msg: str):
 
 # ─── CHROME DRIVER SETUP ───────────────────────────────────────────────────────
 def make_driver():
-    # create a unique temp dir for this Chrome session
-    user_data_dir = tempfile.mkdtemp(prefix="chrome-user-data-")
     opts = Options()
     opts.headless = True
-    opts.add_argument(f"--user-data-dir={user_data_dir}")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-extensions")
@@ -81,7 +77,7 @@ def check_stock(driver, url: str):
     except (TimeoutException, WebDriverException) as e:
         logger.warning(f"⚠️ page-load failed: {e}")
 
-    # 1) Click "Single box" variant if present
+    # 1) Try selecting "Single box" if that variant exists
     try:
         variant_xpath = (
             "//div[contains(@class,'index_sizeInfoItem') "
@@ -91,10 +87,11 @@ def check_stock(driver, url: str):
         wrapper.click()
         logger.info("   clicked Single box")
         time.sleep(1)
-    except Exception as e:
-        logger.debug(f"   variant click skipped: {e}")
+    except Exception:
+        # not every page has that variant
+        pass
 
-    # 2) Look only for the exact ADD TO BAG button
+    # 2) Look specifically for the exact ADD TO BAG button
     try:
         stock_xpath = (
             "//div[contains(@class,'index_usBtn') "
@@ -123,7 +120,7 @@ def main():
     start_health_server()
     driver = make_driver()
 
-    # Align to top of the next minute
+    # align to top of next interval
     time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
 
     while True:
