@@ -1,113 +1,122 @@
 #!/usr/bin/env python3
-import os, time, logging, threading
-from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
+import os
+import sys
+import time
+import logging
+import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
 
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
-PORT           = int(os.getenv("PORT", "8000"))
-PUSH_KEY       = os.getenv("PUSHOVER_USER_KEY")
-PUSH_TOKEN     = os.getenv("PUSHOVER_API_TOKEN")
-PRODUCT_URLS   = [u.strip() for u in os.getenv("PRODUCT_URLS","").split(",") if u.strip()]
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL","60"))
-# ─── LOGGING ──────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# ─── Configuration ─────────────────────────────────────────────────────────────
 
-# ─── HEALTH CHECK ──────────────────────────────────────────────────────────────
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
-    def do_HEAD(self):
-        self.send_response(200); self.end_headers()
+# Comma-separated list of full product URLs in ENV var URLS
+URLS = os.getenv("URLS", "").split(",")
 
-def start_health_server():
-    server = HTTPServer(("", PORT), HealthHandler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    logging.info(f"Health check listening on port {PORT}")
+# Pushover (or whatever) credentials
+PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN")
+PUSHOVER_USER  = os.getenv("PUSHOVER_USER")
 
-# ─── PUSHOVER ──────────────────────────────────────────────────────────────────
-import requests
-def send_pushover(msg: str):
-    if not (PUSH_KEY and PUSH_TOKEN):
-        logging.warning("Missing Pushover creds; skipping")
+# ─── Logging ────────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)7s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# ─── Helper to fire off a push alert ────────────────────────────────────────────
+
+def send_push(title: str, message: str):
+    if not (PUSHOVER_TOKEN and PUSHOVER_USER):
+        logger.warning("Push credentials not set; skipping alert.")
         return
-    try:
-        r = requests.post(
-            "https://api.pushover.net/1/messages.json",
-            data={"token": PUSH_TOKEN, "user": PUSH_KEY, "message": msg},
-            timeout=10
-        )
-        r.raise_for_status()
-        logging.info("✔️ Pushover sent")
-    except Exception as e:
-        logging.error("Pushover error: %s", e)
+    r = requests.post("https://api.pushover.net/1/messages.json", data={
+        "token":   PUSHOVER_TOKEN,
+        "user":    PUSHOVER_USER,
+        "title":   title,
+        "message": message
+    })
+    if r.status_code == 200:
+        logger.info("✔️ Pushover sent")
+    else:
+        logger.error(f"✖️ Pushover failed: {r.status_code} {r.text}")
 
-# ─── SET UP CHROME ─────────────────────────────────────────────────────────────
+# ─── Browser setup ──────────────────────────────────────────────────────────────
+
 def make_driver():
-    chrome_opts = Options()
-    chrome_opts.headless = True
-    chrome_opts.add_argument("--no-sandbox")
-    chrome_opts.add_argument("--disable-gpu")
-    chrome_opts.add_argument("--window-size=1920,1080")
-    chrome_opts.add_argument("--disable-dev-shm-usage")
-    return webdriver.Chrome(options=chrome_opts)
+    opts = Options()
+    opts.add_argument("--headless")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    driver = webdriver.Chrome(options=opts)
+    # limit how long get() can hang
+    driver.set_page_load_timeout(30)
+    return driver
 
-# ─── STOCK CHECK ───────────────────────────────────────────────────────────────
-def check_stock(driver, url):
-    logging.info(f"→ START {url}")
-    driver.get(url)
+# ─── Core check for one URL ─────────────────────────────────────────────────────
 
-    # 1) Accept T&C overlay if it shows up
+def check_stock(driver, url: str):
+    url = url.strip()
+    if not url:
+        return
+
+    logger.info(f"→ START {url}")
     try:
-        accept = WebDriverWait(driver, 5).until(
-            EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Accept')]"))
-        )
-        accept.click()
-        logging.info("   clicked Accept overlay")
-    except TimeoutException:
-        pass
+        driver.get(url)
+    except Exception as e:
+        logger.warning(f"⚠️ page-load failed: {e}")
 
-    # 2) Wait for one of the buttons to appear
+    # 1) Click the “Single box” toggle to ensure the single‐unit inventory is active
     try:
-        btn = WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((
-                By.XPATH,
-                "//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'add to bag')" +
-                " or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'notify me when available')]"
-            ))
+        single_xpath = (
+            "//div[contains(@class,'index_sizeInfoTitle') "
+            "and normalize-space(text())='Single box']"
         )
-        text = btn.text.strip().lower()
-        if "add to bag" in text and "notify" not in text:
-            msg = f"[{datetime.now():%H:%M}] IN STOCK → {url}"
-            logging.info(msg)
-            send_pushover(msg)
+        btn = driver.find_element(By.XPATH, single_xpath)
+        btn.click()
+        logger.info("Clicked Single box")
+        time.sleep(1)
+    except Exception as e:
+        logger.warning(f"Variant click failed: {e}")
+
+    # 2) Look *only* for the EXACT “ADD TO BAG” button
+    try:
+        stock_xpath = "//div[normalize-space(text())='ADD TO BAG']"
+        elems = driver.find_elements(By.XPATH, stock_xpath)
+        if elems:
+            ts = time.strftime("%H:%M")
+            logger.info(f"[{ts}] 🚨 IN STOCK → {url}")
+            send_push("Popmart Restock!", f"{url} is IN STOCK at {ts}")
         else:
-            logging.info("   out of stock (%s)", text)
-    except TimeoutException:
-        logging.error("   buttons never rendered; page may be broken")
+            logger.info("out of stock")
+    except Exception as e:
+        logger.error(f"Button scan failed: {e}")
 
-# ─── MAIN LOOP ────────────────────────────────────────────────────────────────
+    logger.info(f"← END   {url}")
+
+# ─── Main loop ─────────────────────────────────────────────────────────────────
+
 def main():
-    if not PRODUCT_URLS:
-        logging.error("No PRODUCT_URLS in env"); return
+    if not URLS or URLS == [""]:
+        logger.error("No URLs provided. Set the URLS env var.")
+        sys.exit(1)
 
-    start_health_server()
     driver = make_driver()
-    # align to minute
-    time.sleep(CHECK_INTERVAL - time.time() % CHECK_INTERVAL)
 
+    # Warm up
+    logger.info("Health check listening (headless Chrome up)")
+
+    # Run forever, aligned to the top of each minute
     while True:
-        logging.info("🔄 Cycle START")
-        for url in PRODUCT_URLS:
-            check_stock(driver, url)
-        logging.info("✅ Cycle END")
-        time.sleep(CHECK_INTERVAL - time.time() % CHECK_INTERVAL)
+        logger.info("🔄 Cycle START")
+        for u in URLS:
+            check_stock(driver, u)
+        logger.info("✅ Cycle END")
+        # sleep until next minute
+        time_to_next = 60 - (time.time() % 60)
+        time.sleep(time_to_next)
 
 if __name__ == "__main__":
     main()
