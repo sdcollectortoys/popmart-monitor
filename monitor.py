@@ -67,10 +67,8 @@ def make_driver():
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-dev-shm-usage")
-    # disable images for speed
     prefs = {"profile.managed_default_content_settings.images": 2}
     opts.add_experimental_option("prefs", prefs)
-    # randomize UA slightly to avoid simple blocks
     ua = f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
          f" (KHTML, like Gecko) Chrome/{random.randint(90,114)}.0.5481.100 Safari/537.36"
     opts.add_argument(f"--user-agent={ua}")
@@ -88,7 +86,9 @@ def accept_overlays(driver):
         btn = WebDriverWait(driver, 5).until(
             EC.element_to_be_clickable(
                 (By.XPATH,
-                 "//button[normalize-space(text())='I Agree' or normalize-space(text())='Accept' or contains(., 'Continue')]")
+                 "//button[normalize-space(text())='I Agree'"
+                 " or normalize-space(text())='Accept'"
+                 " or contains(., 'Continue')]")
             )
         )
         btn.click()
@@ -100,19 +100,31 @@ def check_stock(driver, url: str) -> str:
     driver.get(url)
     accept_overlays(driver)
 
-    # wait for either button container (whichever appears first)
-    WebDriverWait(driver, 12).until(
-        EC.presence_of_element_located(
-            (By.XPATH,
-             "//button[normalize-space(text())='Add to Bag']"
-             " | //button[normalize-space(text())='Notify Me When Available']")
-        )
+    # wait for either stock button (case-insensitive)
+    xpath_any = (
+        "//button["
+        "contains(translate(normalize-space(.),"
+        " 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+        " 'abcdefghijklmnopqrstuvwxyz'), 'add to bag') "
+        "or "
+        "contains(translate(normalize-space(.),"
+        " 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+        " 'abcdefghijklmnopqrstuvwxyz'), 'notify me when available')"
+        "]"
+    )
+    WebDriverWait(driver, 15).until(
+        EC.presence_of_element_located((By.XPATH, xpath_any))
     )
 
-    # now check for the in-stock button
-    if driver.find_elements(By.XPATH, "//button[normalize-space(text())='Add to Bag']"):
-        return "in"
-    return "out"
+    # now count “Add to Bag” buttons (case-insensitive)
+    xpath_in = (
+        "//button[contains(translate(normalize-space(.),"
+        " 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+        " 'abcdefghijklmnopqrstuvwxyz'), 'add to bag')]"
+    )
+    in_buttons = driver.find_elements(By.XPATH, xpath_in)
+    print(f"debug: found {len(in_buttons)} add-to-bag button(s)")
+    return "in" if in_buttons else "out"
 
 def sleep_until_top_of_minute():
     now = time.time()
@@ -160,7 +172,6 @@ def main():
                 print(f"All attempts failed for {url}", file=sys.stderr)
                 continue
 
-            # compare & persist
             cur.execute("SELECT last_state FROM stock_state WHERE url = ?", (url,))
             row = cur.fetchone()
             old = row[0] if row else "out"
@@ -173,12 +184,15 @@ def main():
 
             if not row:
                 cur.execute(
-                    "INSERT INTO stock_state(url,last_state,updated_at) VALUES(?,?,CURRENT_TIMESTAMP)",
+                    "INSERT INTO stock_state(url,last_state,updated_at) "
+                    "VALUES(?,?,CURRENT_TIMESTAMP)",
                     (url, state)
                 )
             else:
                 cur.execute(
-                    "UPDATE stock_state SET last_state=?, updated_at=CURRENT_TIMESTAMP WHERE url=?",
+                    "UPDATE stock_state "
+                    "SET last_state=?, updated_at=CURRENT_TIMESTAMP "
+                    "WHERE url=?",
                     (state, url)
                 )
             conn.commit()
