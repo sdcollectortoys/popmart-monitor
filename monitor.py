@@ -7,7 +7,6 @@ import signal
 import sqlite3
 import threading
 import random
-import json
 import requests
 
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -40,14 +39,14 @@ def start_health_server(port=10000):
 PUSH_APP_TOKEN = os.environ["PUSHOVER_APP_TOKEN"]
 PUSH_USER_KEY  = os.environ["PUSHOVER_USER_KEY"]
 def send_pushover(message: str):
-    r = requests.post(
+    resp = requests.post(
         "https://api.pushover.net/1/messages.json",
         data={"token": PUSH_APP_TOKEN, "user": PUSH_USER_KEY, "message": message},
         timeout=10,
     )
-    r.raise_for_status()
+    resp.raise_for_status()
 
-# ---- SQLite persistence ----
+# ---- SQLite state persistence ----
 DB_PATH = "state.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
@@ -61,33 +60,59 @@ def init_db():
     conn.commit()
     return conn
 
-# ---- WebDriver factory with Performance logging ----
+# ---- Selenium WebDriver factory with stealth ----
 def make_driver():
-    # enable Chrome Performance logs
+    # Enable performance logs (unused now, but harmless)
     caps = DesiredCapabilities.CHROME.copy()
     caps['goog:loggingPrefs'] = {'performance': 'ALL'}
 
     opts = Options()
     opts.page_load_strategy = 'eager'
-    opts.add_argument("--headless")
+    opts.add_argument("--headless=new")  # use new headless mode
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--lang=en-US")
+
+    # anti-automation flags
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+
+    # disable images for speed
     opts.add_experimental_option("prefs", {
         "profile.managed_default_content_settings.images": 2
     })
+
+    # random-ish UA
     ua = (
-        f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        f"(KHTML, like Gecko) Chrome/{random.randint(90,114)}.0.5481.100 Safari/537.36"
+        f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        f"AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{random.randint(100,116)}.0.0.0 Safari/537.36"
     )
     opts.add_argument(f"--user-agent={ua}")
-    opts.add_argument(f"--user-data-dir=/tmp/stockmon-{uuid.uuid4()}")
+
+    # per-run user-data-dir
+    profile = f"/tmp/stockmon-{uuid.uuid4()}"
+    opts.add_argument(f"--user-data-dir={profile}")
 
     driver = webdriver.Chrome(desired_capabilities=caps, options=opts)
+
+    # Inject stealth script so navigator.webdriver is undefined
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+        "source": """
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+        """
+    })
+
     driver.set_page_load_timeout(20)
     return driver
 
-# ---- Dismiss popups ----
+# ---- Overlay acceptance ----
 def accept_overlays(driver):
     try:
         btn = WebDriverWait(driver, 5).until(
@@ -102,54 +127,34 @@ def accept_overlays(driver):
     except TimeoutException:
         pass
 
-# ---- Stock check via intercepted XHR ----
+# ---- Stock check via text search ----
 def check_stock(driver, url: str) -> str:
-    # start capturing network
-    driver.execute_cdp_cmd('Network.enable', {})
-    # clear any old logs
-    driver.get_log('performance')
-
     driver.get(url)
     accept_overlays(driver)
-    # allow any JS to fire off API calls
-    time.sleep(1)
 
-    # pull the performance logs
-    logs = driver.get_log('performance')
-    for entry in logs:
-        msg = json.loads(entry['message'])['message']
-        if msg.get('method') == 'Network.responseReceived':
-            params = msg['params']
-            resp = params.get('response', {})
-            api_url = resp.get('url', '')
-            if 'productDetails' in api_url and 'spuId=' in api_url:
-                # fetch its response body
-                rid = params['requestId']
-                body = driver.execute_cdp_cmd('Network.getResponseBody', {'requestId': rid})
-                payload = json.loads(body.get('body','{}'))
-                skus = payload.get('data', {}).get('skus', [])
-                # if any SKU has onlineStock > 0, we’re in stock
-                for sku in skus:
-                    if sku.get('stock', {}).get('onlineStock', 0) > 0:
-                        return "in"
-                return "out"
+    # give JS time to render the buy-button
+    time.sleep(2)
 
-    # --- fallback to old DOM check (should rarely hit) ---
-    usbtns = driver.find_elements(By.XPATH, "//div[contains(@class,'index_usBtn')]")
-    for btn in usbtns:
-        if "add to bag" in btn.text.strip().lower():
-            return "in"
-    return "out"
+    # find any element whose text contains "ADD TO BAG" (case-insensitive)
+    xpath_in = (
+        "//*[contains(translate(normalize-space(.),"
+        " 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+        " 'abcdefghijklmnopqrstuvwxyz'), 'add to bag')]"
+    )
+    elems = driver.find_elements(By.XPATH, xpath_in)
+    print(f"debug: found {len(elems)} ADD TO BAG element(s)")
+    return "in" if elems else "out"
 
 def sleep_until_top_of_minute():
     now = time.time()
-    time.sleep(60 - (now % 60) + random.uniform(0,1))
+    delay = 60 - (now % 60)
+    time.sleep(delay + random.uniform(0, 1))
 
-# ---- Main loop ----
+# ---- Main service ----
 def main():
-    urls = [u.strip() for u in os.environ.get("PRODUCT_URLS","").split(",") if u.strip()]
+    urls = [u.strip() for u in os.environ.get("PRODUCT_URLS", "").split(",") if u.strip()]
     if not urls:
-        print("No PRODUCT_URLS set; exiting.")
+        print("No PRODUCT_URLS configured; exiting.")
         sys.exit(1)
 
     conn = init_db()
@@ -175,12 +180,12 @@ def main():
         sleep_until_top_of_minute()
         for url in urls:
             state = None
-            for attempt in range(1,4):
+            for attempt in range(1, 4):
                 try:
                     state = check_stock(driver, url)
                     break
                 except WebDriverException as e:
-                    print(f"[Attempt {attempt}] error on {url}: {e}", file=sys.stderr)
+                    print(f"[Attempt {attempt}] error checking {url}: {e}", file=sys.stderr)
                     time.sleep(attempt)
             if state is None:
                 print(f"All attempts failed for {url}", file=sys.stderr)
@@ -204,7 +209,9 @@ def main():
                 )
             else:
                 cur.execute(
-                    "UPDATE stock_state SET last_state=?, updated_at=CURRENT_TIMESTAMP WHERE url=?",
+                    "UPDATE stock_state "
+                    "SET last_state=?, updated_at=CURRENT_TIMESTAMP "
+                    "WHERE url=?",
                     (state, url)
                 )
             conn.commit()
