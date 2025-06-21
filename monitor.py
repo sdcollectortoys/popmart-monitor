@@ -72,21 +72,18 @@ def check_stock(url: str):
         logging.error("   no __NEXT_DATA__ on page")
         return
 
-    # 2) Parse __NEXT_DATA__ to get buildId and reconstruct route
+    # 2) Parse __NEXT_DATA__ to get buildId + route template + query
     try:
-        d = json.loads(script.string)
+        d        = json.loads(script.string)
         build_id = d["buildId"]
-
-        query = d.get("query", {})
-        if "queryParams" in query and isinstance(query["queryParams"], list):
-            segments = query["queryParams"]
-        elif "id" in query and "slug" in query:
-            segments = ["us", "products", query["id"], query["slug"]]
-        else:
-            logging.error("   cannot reconstruct route from __NEXT_DATA__.query")
+        page_tpl = d.get("page", "")      # e.g. "/us/products/[id]/[slug]"
+        query    = d.get("query", {})     # contains "id" and "slug"
+        if not page_tpl or "id" not in query or "slug" not in query:
+            logging.error("   cannot reconstruct route; missing page or query")
             return
 
-        route = "/" + "/".join(segments)  # e.g. "/us/products/878/..."
+        # fill in the template
+        route = page_tpl.replace("[id]", str(query["id"])).replace("[slug]", query["slug"])
     except Exception as e:
         logging.error("   parsing __NEXT_DATA__ failed: %s", e)
         return
@@ -94,25 +91,20 @@ def check_stock(url: str):
     parsed = urlparse(url)
     host   = f"{parsed.scheme}://{parsed.netloc}"
 
-    # 3) Try the dynamic and static JSON endpoints
-    candidates = [
-        f"{host}/_next/data/{build_id}{route}.json",
-        f"{host}{route}.json"
-    ]
-    payload = None
-
-    for endpoint in candidates:
-        logging.info(f"   debug: trying JSON at {endpoint}")
+    # 3) Try dynamic Next.js JSON, then static fallback
+    dyn_url = f"{host}/_next/data/{build_id}{route}.json"
+    static_url = f"{host}{route}.json"
+    for candidate in (dyn_url, static_url):
+        logging.info(f"   debug: trying JSON at {candidate}")
         try:
-            jr = requests.get(endpoint, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            jr = requests.get(candidate, headers=HEADERS, timeout=REQUEST_TIMEOUT)
             if jr.status_code != 200:
                 continue
             payload = jr.json()
             break
         except Exception:
             continue
-
-    if not payload:
+    else:
         logging.error("   all JSON endpoints failed")
         return
 
@@ -127,7 +119,7 @@ def check_stock(url: str):
         logging.error("   JSON parse error: %s", e)
         return
 
-    # 5) Send alert if in stock
+    # 5) Alert if in stock
     if in_stock:
         msg = f"[{datetime.now():%H:%M}] IN STOCK → {url}"
         logging.info(msg)
@@ -142,7 +134,7 @@ def main():
         return
 
     start_health_server()
-    # align to the next interval boundary
+    # align to the next interval
     time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
     while True:
         logging.info("🔄 Cycle START")
@@ -151,5 +143,5 @@ def main():
         logging.info("✅ Cycle END")
         time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
