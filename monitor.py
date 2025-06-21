@@ -5,6 +5,7 @@ import time
 import logging
 import requests
 import threading
+import tempfile
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -57,13 +58,17 @@ def send_push(msg: str):
 
 # ─── CHROME DRIVER SETUP ───────────────────────────────────────────────────────
 def make_driver():
+    # create a unique temp dir for this Chrome session
+    user_data_dir = tempfile.mkdtemp(prefix="chrome-user-data-")
     opts = Options()
     opts.headless = True
+    opts.add_argument(f"--user-data-dir={user_data_dir}")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
+
     driver = webdriver.Chrome(options=opts)
     driver.set_page_load_timeout(30)
     return driver
