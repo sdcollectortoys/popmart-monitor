@@ -60,12 +60,14 @@ def check_stock(url: str):
         return
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    buttons = soup.find_all(
-        "div",
-        class_=lambda c: c and "index_usBtn" in c,
-        string=lambda txt: txt and txt.strip().upper() == "ADD TO BAG"
-    )
-    found = len(buttons)
+
+    # scan every <div> for exact text "ADD TO BAG" (case-insensitive)
+    found = 0
+    for div in soup.find_all("div"):
+        txt = div.get_text(strip=True)
+        if txt.upper() == "ADD TO BAG":
+            found += 1
+
     logger.info(f"   debug: found {found} ADD TO BAG button(s)")
     if found:
         ts  = datetime.now().strftime("%H:%M")
@@ -85,7 +87,7 @@ def main():
 
     start_health_server()
 
-    # align to interval
+    # align to the top of the next interval
     time.sleep(CHECK_INTERVAL - (time.time() % CHECK_INTERVAL))
 
     while True:
