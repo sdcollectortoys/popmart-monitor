@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-import os, sys, time, uuid, signal, sqlite3, threading, random, requests
+import os
+import sys
+import time
+import uuid
+import signal
+import sqlite3
+import threading
+import random
+import requests
+
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -12,9 +21,12 @@ from selenium.webdriver.support import expected_conditions as EC
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/health"):
-            self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
         else:
-            self.send_response(404); self.end_headers()
+            self.send_response(404)
+            self.end_headers()
 
 def start_health_server(port=10000):
     srv = HTTPServer(("", port), HealthHandler)
@@ -25,13 +37,13 @@ def start_health_server(port=10000):
 # ---- Pushover alert ----
 PUSH_APP_TOKEN = os.environ["PUSHOVER_APP_TOKEN"]
 PUSH_USER_KEY  = os.environ["PUSHOVER_USER_KEY"]
-def send_pushover(msg: str):
-    r = requests.post(
+def send_pushover(message: str):
+    resp = requests.post(
         "https://api.pushover.net/1/messages.json",
-        data={"token": PUSH_APP_TOKEN, "user": PUSH_USER_KEY, "message": msg},
-        timeout=10
+        data={"token": PUSH_APP_TOKEN, "user": PUSH_USER_KEY, "message": message},
+        timeout=10,
     )
-    r.raise_for_status()
+    resp.raise_for_status()
 
 # ---- SQLite state persistence ----
 DB_PATH = "state.db"
@@ -47,7 +59,7 @@ def init_db():
     conn.commit()
     return conn
 
-# ---- Selenium WebDriver factory ----
+# ---- Selenium WebDriver factory (eager + no images) ----
 def make_driver():
     opts = Options()
     opts.page_load_strategy = 'eager'
@@ -55,63 +67,79 @@ def make_driver():
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-dev-shm-usage")
-    opts.add_experimental_option("prefs", {"profile.managed_default_content_settings.images": 2})
-    ua = f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " \
-         f"(KHTML, like Gecko) Chrome/{random.randint(90,114)}.0.5481.100 Safari/537.36"
+    # disable images for speed
+    opts.add_experimental_option("prefs", {
+        "profile.managed_default_content_settings.images": 2
+    })
+    # randomize UA slightly to avoid simple blocks
+    ua = (
+        f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{random.randint(90,114)}.0.5481.100 Safari/537.36"
+    )
     opts.add_argument(f"--user-agent={ua}")
-    opts.add_argument(f"--user-data-dir=/tmp/stockmon-{uuid.uuid4()}")
-    drv = webdriver.Chrome(options=opts)
-    drv.set_page_load_timeout(20)
-    return drv
 
-# ---- Dismiss overlays ----
+    profile = f"/tmp/stockmon-{uuid.uuid4()}"
+    opts.add_argument(f"--user-data-dir={profile}")
+
+    driver = webdriver.Chrome(options=opts)
+    driver.set_page_load_timeout(20)
+    return driver
+
+# ---- Overlay acceptance ----
 def accept_overlays(driver):
     try:
         btn = WebDriverWait(driver, 5).until(
             EC.element_to_be_clickable((By.XPATH,
                 "//button[normalize-space(text())='I Agree'"
                 " or normalize-space(text())='Accept'"
-                " or contains(., 'Continue')]"))
+                " or contains(., 'Continue')]"
+            ))
         )
-        btn.click(); time.sleep(0.5)
+        btn.click()
+        time.sleep(0.5)
     except TimeoutException:
         pass
 
-# ---- DEBUG Stock check ----
+# ---- Stock check (single-variant fallback) ----
 def check_stock(driver, url: str) -> str:
     driver.get(url)
     accept_overlays(driver)
-    time.sleep(1)  # give JS a moment
 
-    # find all the product‐page "usBtn" divs
+    # Wait for either the usBtn-divs or the Notify-Me button.
+    any_xpath = (
+        "//div[contains(@class,'index_usBtn')]"
+        " | //button[contains(translate(normalize-space(.),"
+        " 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+        " 'abcdefghijklmnopqrstuvwxyz'),'notify me when available')]"
+    )
+    WebDriverWait(driver, 15).until(
+        EC.presence_of_element_located((By.XPATH, any_xpath))
+    )
+
+    # Grab all the “usBtn” divs
     usbtns = driver.find_elements(By.XPATH, "//div[contains(@class,'index_usBtn')]")
-    print(f"debug: URL={url} → found {len(usbtns)} index_usBtn element(s)")
+    print(f"debug: found {len(usbtns)} usBtn element(s)")
 
-    # print out their text and outerHTML so we can see exactly what’s there
-    for i, btn in enumerate(usbtns, start=1):
-        txt = btn.text.strip()
-        outer = btn.get_attribute("outerHTML")
-        print(f"debug:   [{i}] text='{txt}'")
-        print(f"debug:   [{i}] outerHTML={outer}")
-
-    # decide in/out based on exact text match
+    # Return “in” if any of them reads “ADD TO BAG” (case-insensitive)
     for btn in usbtns:
-        if btn.text.strip().lower() == "add to bag":
+        if "add to bag" in btn.text.strip().lower():
             return "in"
     return "out"
 
 def sleep_until_top_of_minute():
     now = time.time()
     delay = 60 - (now % 60)
-    time.sleep(delay + random.uniform(0,1))
+    time.sleep(delay + random.uniform(0, 1))
 
-# ---- Main loop ----
+# ---- Main service ----
 def main():
-    urls = [u.strip() for u in os.environ.get("PRODUCT_URLS","").split(",") if u.strip()]
+    urls = [u.strip() for u in os.environ.get("PRODUCT_URLS", "").split(",") if u.strip()]
     if not urls:
-        print("No PRODUCT_URLS configured; exiting."); sys.exit(1)
+        print("No PRODUCT_URLS configured; exiting.")
+        sys.exit(1)
 
-    conn = init_db(); cur = conn.cursor()
+    conn = init_db()
+    cur = conn.cursor()
     driver = make_driver()
     health_srv = start_health_server()
 
@@ -133,7 +161,7 @@ def main():
         sleep_until_top_of_minute()
         for url in urls:
             state = None
-            for attempt in range(1,4):
+            for attempt in range(1, 4):
                 try:
                     state = check_stock(driver, url)
                     break
@@ -144,23 +172,29 @@ def main():
                 print(f"All attempts failed for {url}", file=sys.stderr)
                 continue
 
-            cur.execute("SELECT last_state FROM stock_state WHERE url=?", (url,))
+            # Persist & alert on out→in transitions
+            cur.execute("SELECT last_state FROM stock_state WHERE url = ?", (url,))
             row = cur.fetchone()
             old = row[0] if row else "out"
-            if old=="out" and state=="in":
+            if old == "out" and state == "in":
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {url} → IN STOCK!")
-                try: send_pushover(f"🔥 In stock: {url}")
-                except Exception as e: print(f"Pushover err: {e}", file=sys.stderr)
+                try:
+                    send_pushover(f"🔥 In stock: {url}")
+                except Exception as e:
+                    print(f"Pushover error: {e}", file=sys.stderr)
 
             if not row:
                 cur.execute(
-                  "INSERT INTO stock_state(url,last_state,updated_at) VALUES(?,?,CURRENT_TIMESTAMP)",
-                  (url, state)
+                    "INSERT INTO stock_state(url,last_state,updated_at) "
+                    "VALUES(?,?,CURRENT_TIMESTAMP)",
+                    (url, state)
                 )
             else:
                 cur.execute(
-                  "UPDATE stock_state SET last_state=?, updated_at=CURRENT_TIMESTAMP WHERE url=?",
-                  (state, url)
+                    "UPDATE stock_state "
+                    "SET last_state=?, updated_at=CURRENT_TIMESTAMP "
+                    "WHERE url=?",
+                    (state, url)
                 )
             conn.commit()
 
