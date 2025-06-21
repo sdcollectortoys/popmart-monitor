@@ -19,7 +19,7 @@ def start_health_server(port=10000):
 
 # ---- Pushover alert ----
 PUSHOVER_API_TOKEN = os.environ["PUSHOVER_API_TOKEN"]
-PUSHOVER_USER_KEY  = os.environ["PUSHOVER_USER_KEYY"]
+PUSHOVER_USER_KEY  = os.environ["PUSHOVER_USER_KEY"]
 def send_pushover(msg: str):
     r = requests.post(
         "https://api.pushover.net/1/messages.json",
