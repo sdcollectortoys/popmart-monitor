@@ -13,17 +13,16 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def start_health_server(port=10000):
     srv = HTTPServer(("", port), HealthHandler)
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
 
 # ---- Pushover alert ----
-PUSHOVER_API_TOKEN = os.environ["PUSHOVER_API_TOKEN"]
-PUSHOVER_USER_KEY  = os.environ["PUSHOVER_USER_KEY"]
+PUSH_APP_TOKEN = os.environ.get("PUSHOVER_APP_TOKEN") or os.environ["PUSHOVER_API_TOKEN"]
+PUSH_USER_KEY  = os.environ["PUSHOVER_USER_KEY"]
 def send_pushover(msg: str):
     r = requests.post(
         "https://api.pushover.net/1/messages.json",
-        data={"token": PUSHOVER_API_TOKEN, "user": PUSHOVER_USER_KEY, "message": msg},
+        data={"token": PUSH_APP_TOKEN, "user": PUSH_USER_KEY, "message": msg},
         timeout=10
     )
     r.raise_for_status()
@@ -42,34 +41,39 @@ def init_db():
     conn.commit()
     return conn
 
-# ---- Stock check with Playwright ----
+# ---- Stock check via XHR ----
 def check_stock(page, url: str) -> str:
-    # Navigate and wait for network to be quiet
+    # Kick off navigation and wait for network idle
     page.goto(url, wait_until="networkidle", timeout=30000)
 
-    # Dismiss any overlay
-    try:
-        for selector in ["text='I Agree'", "text='Accept'", "button:has-text('Continue')"]:
-            if page.query_selector(selector):
-                page.click(selector)
+    # Dismiss any overlay if present
+    for sel in ["text='I Agree'", "text='Accept'", "button:has-text('Continue')"]:
+        try:
+            if page.query_selector(sel):
+                page.click(sel)
                 page.wait_for_timeout(500)
-    except PlaywrightTimeout:
-        pass
+        except PlaywrightTimeout:
+            pass
 
-    # Wait for either "ADD TO BAG" or "NOTIFY ME" to appear anywhere on page
+    # Wait for the productDetails XHR response
     try:
-        page.wait_for_selector("text=/add to bag/i", timeout=10000)
+        resp = page.wait_for_response(
+            lambda r: "productDetails" in r.url and "spuId=" in r.url,
+            timeout=10000
+        )
     except PlaywrightTimeout:
         return "out"
 
-    # Check if any element has the text "ADD TO BAG"
-    elems = page.query_selector_all("text=/add to bag/i")
-    print(f"debug: found {len(elems)} ADD TO BAG element(s)")
-    return "in" if elems else "out"
+    data = resp.json()
+    skus = data.get("data", {}).get("skus", [])
+    for sku in skus:
+        if sku.get("stock", {}).get("onlineStock", 0) > 0:
+            return "in"
+    return "out"
 
 def sleep_until_top_of_minute():
-    now = time.time(); delay = 60 - (now % 60)
-    time.sleep(delay + random.uniform(0,1))
+    now = time.time()
+    time.sleep(60 - (now % 60) + random.uniform(0,1))
 
 # ---- Main service ----
 def main():
@@ -77,7 +81,8 @@ def main():
     if not urls:
         print("No PRODUCT_URLS configured; exiting."); sys.exit(1)
 
-    conn = init_db(); cur = conn.cursor()
+    conn = init_db()
+    cur = conn.cursor()
     health_srv = start_health_server()
 
     def clean_exit(*_):
@@ -92,10 +97,8 @@ def main():
     print("Launching browser…")
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=[
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--lang=en-US",
-            "--window-size=1920,1080",
+            "--no-sandbox", "--disable-dev-shm-usage", "--lang=en-US",
+            "--window-size=1920,1080"
         ])
         context = browser.new_context(
             user_agent=(
@@ -104,10 +107,9 @@ def main():
                 f"Chrome/{random.randint(100,116)}.0.0.0 Safari/537.36"
             ),
             viewport={"width":1920, "height":1080},
-            locale="en-US",
-            java_script_enabled=True,
+            locale="en-US"
         )
-        # disable images for speed
+        # block images
         context.route("**/*.{png,jpg,jpeg,svg,webp,gif}", lambda route: route.abort())
         page = context.new_page()
 
@@ -136,8 +138,8 @@ def main():
 
                 if not row:
                     cur.execute(
-                        "INSERT INTO stock_state(url,last_state,updated_at) VALUES(?,?,CURRENT_TIMESTAMP)",
-                        (url, state)
+                        "INSERT INTO stock_state(url,last_state,updated_at) "
+                        "VALUES(?,?,CURRENT_TIMESTAMP)", (url, state)
                     )
                 else:
                     cur.execute(
