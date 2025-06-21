@@ -1,20 +1,29 @@
 FROM python:3.11-slim
 
+# 1. Install OS-level dependencies for Playwright
 RUN apt-get update \
- && apt-get install -y wget gnupg2 unzip \
- && wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
-    | apt-key add - \
- && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" \
-    > /etc/apt/sources.list.d/google-chrome.list \
- && apt-get update \
- && apt-get install -y google-chrome-stable \
-    fonts-liberation libappindicator3-1 libasound2 libatk-bridge2.0-0 \
-    libcairo2 libdbus-1-3 libdrm2 libgtk-3-0 libnspr4 libnss3 \
+ && apt-get install -y \
+    wget gnupg2 curl \
+    libnss3 libatk-bridge2.0-0 libcairo2 \
+    libx11-xcb1 libxcomposite1 libxdamage1 \
+    libxrandr2 libgbm1 libpangocairo-1.0-0 \
+    libpango-1.0-0 libasound2 libatspi2.0-0 \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# 2. Install Python dependencies (including playwright)
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
+
+# 3. Install Playwright’s Chromium browser
+RUN playwright install --with-deps chromium
+
+# 4. Copy application code
 COPY . .
+
+# 5. Expose health-check port
 EXPOSE 10000
-CMD ["./start.sh"]
+
+# 6. Start your monitor
+CMD ["python3", "monitor.py"]

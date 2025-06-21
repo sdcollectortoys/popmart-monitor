@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 import os, sys, time, uuid, signal, sqlite3, threading, random, requests
 from http.server import BaseHTTPRequestHandler, HTTPServer
-
-import undetected_chromedriver as uc
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 # ---- Health-check HTTP server ----
 class HealthHandler(BaseHTTPRequestHandler):
@@ -33,7 +28,7 @@ def send_pushover(msg: str):
     )
     r.raise_for_status()
 
-# ---- SQLite state persistence ----
+# ---- SQLite persistence ----
 DB_PATH = "state.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
@@ -47,68 +42,28 @@ def init_db():
     conn.commit()
     return conn
 
-# ---- undetected-chromedriver factory ----
-def make_driver():
-    opts = uc.ChromeOptions()
-    opts.headless = True
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--lang=en-US")
-    opts.add_argument("--window-size=1920,1080")
-    # disable images for speed
-    prefs = {"profile.managed_default_content_settings.images": 2}
-    opts.add_experimental_option("prefs", prefs)
+# ---- Stock check with Playwright ----
+def check_stock(page, url: str) -> str:
+    # Navigate and wait for network to be quiet
+    page.goto(url, wait_until="networkidle", timeout=30000)
 
-    # random UA to avoid fingerprinting
-    ua = (
-        f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        f"AppleWebKit/537.36 (KHTML, like Gecko) "
-        f"Chrome/{random.randint(100,118)}.0.0.0 Safari/537.36"
-    )
-    opts.add_argument(f"--user-agent={ua}")
-
-    # unique profile dir
-    opts.add_argument(f"--user-data-dir=/tmp/stockmon-{uuid.uuid4()}")
-
-    driver = uc.Chrome(options=opts)
-    driver.set_page_load_timeout(20)
-    return driver
-
-# ---- Dismiss overlays ----
-def accept_overlays(driver):
+    # Dismiss any overlay
     try:
-        btn = WebDriverWait(driver, 5).until(
-            EC.element_to_be_clickable((By.XPATH,
-                "//button[normalize-space()='I Agree' or normalize-space()='Accept' or contains(., 'Continue')]"
-            ))
-        )
-        btn.click(); time.sleep(0.5)
-    except TimeoutException:
+        for selector in ["text='I Agree'", "text='Accept'", "button:has-text('Continue')"]:
+            if page.query_selector(selector):
+                page.click(selector)
+                page.wait_for_timeout(500)
+    except PlaywrightTimeout:
         pass
 
-# ---- Stock check ----
-def check_stock(driver, url: str) -> str:
-    driver.get(url)
-    accept_overlays(driver)
-
-    # wait up to 10s for the real “ADD TO BAG” div to appear in ANY tag
+    # Wait for either "ADD TO BAG" or "NOTIFY ME" to appear anywhere on page
     try:
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((
-                By.XPATH,
-                "//*[contains(translate(normalize-space(.),"
-                " 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
-                " 'abcdefghijklmnopqrstuvwxyz'), 'add to bag')]"
-            ))
-        )
-    except TimeoutException:
+        page.wait_for_selector("text=/add to bag/i", timeout=10000)
+    except PlaywrightTimeout:
         return "out"
 
-    elems = driver.find_elements(By.XPATH,
-        "//*[contains(translate(normalize-space(.),"
-        " 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
-        " 'abcdefghijklmnopqrstuvwxyz'), 'add to bag')]"
-    )
+    # Check if any element has the text "ADD TO BAG"
+    elems = page.query_selector_all("text=/add to bag/i")
     print(f"debug: found {len(elems)} ADD TO BAG element(s)")
     return "in" if elems else "out"
 
@@ -123,56 +78,75 @@ def main():
         print("No PRODUCT_URLS configured; exiting."); sys.exit(1)
 
     conn = init_db(); cur = conn.cursor()
-    driver = make_driver()
     health_srv = start_health_server()
 
     def clean_exit(*_):
         print("Shutting down...")
-        try: driver.quit()
-        except: pass
-        try: conn.close()
-        except: pass
-        try: health_srv.shutdown()
-        except: pass
+        conn.close()
+        health_srv.shutdown()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, clean_exit)
     signal.signal(signal.SIGTERM, clean_exit)
 
-    print("Monitor started. Polling every minute.")
-    while True:
-        sleep_until_top_of_minute()
-        for url in urls:
-            state = None
-            for i in range(1,4):
-                try:
-                    state = check_stock(driver, url)
-                    break
-                except WebDriverException as e:
-                    print(f"[Attempt {i}] error on {url}: {e}", file=sys.stderr)
-                    time.sleep(i)
-            if state is None:
-                print(f"All attempts failed for {url}", file=sys.stderr)
-                continue
+    print("Launching browser…")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--lang=en-US",
+            "--window-size=1920,1080",
+        ])
+        context = browser.new_context(
+            user_agent=(
+                f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                f"AppleWebKit/537.36 (KHTML, like Gecko) "
+                f"Chrome/{random.randint(100,116)}.0.0.0 Safari/537.36"
+            ),
+            viewport={"width":1920, "height":1080},
+            locale="en-US",
+            java_script_enabled=True,
+        )
+        # disable images for speed
+        context.route("**/*.{png,jpg,jpeg,svg,webp,gif}", lambda route: route.abort())
+        page = context.new_page()
 
-            cur.execute("SELECT last_state FROM stock_state WHERE url = ?", (url,))
-            row = cur.fetchone(); old = row[0] if row else "out"
-            if old == "out" and state == "in":
-                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {url} → IN STOCK!")
-                try: send_pushover(f"🔥 In stock: {url}")
-                except Exception as e: print(f"Pushover error: {e}", file=sys.stderr)
+        print("Monitor started. Polling every minute.")
+        while True:
+            sleep_until_top_of_minute()
+            for url in urls:
+                state = None
+                for attempt in range(1,4):
+                    try:
+                        state = check_stock(page, url)
+                        break
+                    except Exception as e:
+                        print(f"[Attempt {attempt}] error on {url}: {e}", file=sys.stderr)
+                        time.sleep(attempt)
+                if state is None:
+                    print(f"All attempts failed for {url}", file=sys.stderr)
+                    continue
 
-            if not row:
-                cur.execute(
-                    "INSERT INTO stock_state(url,last_state,updated_at) "
-                    "VALUES(?,?,CURRENT_TIMESTAMP)", (url, state)
-                )
-            else:
-                cur.execute(
-                    "UPDATE stock_state SET last_state=?, updated_at=CURRENT_TIMESTAMP WHERE url=?",
-                    (state, url)
-                )
-            conn.commit()
+                cur.execute("SELECT last_state FROM stock_state WHERE url=?", (url,))
+                row = cur.fetchone(); old = row[0] if row else "out"
+                if old=="out" and state=="in":
+                    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {url} → IN STOCK!")
+                    try: send_pushover(f"🔥 In stock: {url}")
+                    except Exception as e: print(f"Pushover error: {e}", file=sys.stderr)
+
+                if not row:
+                    cur.execute(
+                        "INSERT INTO stock_state(url,last_state,updated_at) VALUES(?,?,CURRENT_TIMESTAMP)",
+                        (url, state)
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE stock_state SET last_state=?, updated_at=CURRENT_TIMESTAMP WHERE url=?",
+                        (state, url)
+                    )
+                conn.commit()
+
+        browser.close()
 
 if __name__ == "__main__":
     main()
