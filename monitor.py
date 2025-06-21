@@ -100,13 +100,13 @@ def accept_overlays(driver):
     except TimeoutException:
         pass
 
-# ---- Stock check (matches ANY element, case-insensitive) ----
+# ---- Stock check (iterates variants & matches ANY element with “ADD TO BAG”) ----
 def check_stock(driver, url: str) -> str:
     driver.get(url)
     accept_overlays(driver)
 
-    # wait for either "add to bag" or "notify me when available" to appear
-    xpath_any = (
+    # XPaths for detection (case-insensitive via translate)
+    xpath_buy_any = (
         "//*["
         "contains(translate(normalize-space(.),"
         " 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
@@ -117,19 +117,57 @@ def check_stock(driver, url: str) -> str:
         " 'abcdefghijklmnopqrstuvwxyz'), 'notify me when available')"
         "]"
     )
-    WebDriverWait(driver, 15).until(
-        EC.presence_of_element_located((By.XPATH, xpath_any))
-    )
-
-    # now detect "add to bag" elements
-    xpath_in = (
+    xpath_buy_in = (
         "//*[contains(translate(normalize-space(.),"
         " 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
         " 'abcdefghijklmnopqrstuvwxyz'), 'add to bag')]"
     )
-    elements = driver.find_elements(By.XPATH, xpath_in)
-    print(f"debug: found {len(elements)} ADD TO BAG element(s)")
-    return "in" if elements else "out"
+
+    # Find all variant tabs (Single box / Whole set)
+    try:
+        variants = WebDriverWait(driver, 8).until(
+            EC.presence_of_all_elements_located(
+                (By.XPATH, "//div[contains(@class,'index_sizeInfoItem')]")
+            )
+        )
+    except TimeoutException:
+        variants = driver.find_elements(By.XPATH, "//div[contains(@class,'index_sizeInfoItem')]")
+
+    # Test each variant: click → wait for stock UI → see if “ADD TO BAG” appears
+    for item in variants:
+        # get the variant name text
+        try:
+            title = item.find_element(By.XPATH, ".//div[contains(@class,'index_sizeInfoTitle')]").text.strip().lower()
+        except:
+            title = "<unknown>"
+        # only consider box/set variants
+        if title not in ("single box", "whole set"):
+            continue
+
+        # click that variant tab
+        try:
+            driver.execute_script("arguments[0].scrollIntoView(true);", item)
+            item.click()
+            time.sleep(0.5)
+        except:
+            continue
+
+        # wait for stock UI to render for this variant
+        try:
+            WebDriverWait(driver, 6).until(
+                EC.presence_of_element_located((By.XPATH, xpath_buy_any))
+            )
+        except TimeoutException:
+            continue
+
+        # now check for “ADD TO BAG”
+        found = driver.find_elements(By.XPATH, xpath_buy_in)
+        print(f"debug: variant '{title}' → found {len(found)} ADD TO BAG element(s)")
+        if found:
+            return "in"
+
+    # if none of the variants showed “ADD TO BAG”
+    return "out"
 
 def sleep_until_top_of_minute():
     now = time.time()
@@ -177,6 +215,7 @@ def main():
                 print(f"All attempts failed for {url}", file=sys.stderr)
                 continue
 
+            # compare & persist
             cur.execute("SELECT last_state FROM stock_state WHERE url = ?", (url,))
             row = cur.fetchone()
             old = row[0] if row else "out"
