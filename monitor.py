@@ -2,10 +2,10 @@
 import os
 import sys
 import time
+import random
 import signal
 import sqlite3
 import threading
-import random
 import requests
 
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -22,7 +22,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-def start_health_server(port=10000):
+def start_health_server(port: int = 10000):
     srv = HTTPServer(("", port), HealthHandler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
@@ -39,7 +39,7 @@ def send_pushover(message: str):
     )
     resp.raise_for_status()
 
-# ---- SQLite state persistence ----
+# ---- SQLite persistence ----
 DB_PATH = "state.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
@@ -53,14 +53,14 @@ def init_db():
     conn.commit()
     return conn
 
-# ---- Stock check via direct XHR interception ----
+# ---- Stock check via productDetails XHR ----
 def check_stock(page, url: str) -> str:
-    # Capture the productDetails XHR while navigating
+    # Expect the productDetails XHR while navigating
     with page.expect_response(
         lambda r: "productDetails" in r.url and "spuId=" in r.url,
-        timeout=10000
+        timeout=10_000
     ) as resp_info:
-        page.goto(url, wait_until="networkidle", timeout=30000)
+        page.goto(url, wait_until="networkidle", timeout=30_000)
     resp = resp_info.value
 
     try:
@@ -76,11 +76,16 @@ def check_stock(page, url: str) -> str:
 
 def sleep_until_top_of_minute():
     now = time.time()
-    time.sleep(60 - (now % 60) + random.uniform(0, 1))
+    delay = 60 - (now % 60)
+    time.sleep(delay + random.uniform(0, 1))
 
 # ---- Main service ----
 def main():
-    urls = [u.strip() for u in os.environ.get("PRODUCT_URLS", "").split(",") if u.strip()]
+    urls = [
+        u.strip()
+        for u in os.environ.get("PRODUCT_URLS", "").split(",")
+        if u.strip()
+    ]
     if not urls:
         print("No PRODUCT_URLS configured; exiting.")
         sys.exit(1)
@@ -91,8 +96,10 @@ def main():
 
     def clean_exit(*_):
         print("Shutting down...")
-        conn.close()
-        health_srv.shutdown()
+        try: conn.close()
+        except: pass
+        try: health_srv.shutdown()
+        except: pass
         sys.exit(0)
 
     signal.signal(signal.SIGINT, clean_exit)
@@ -106,7 +113,7 @@ def main():
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--lang=en-US",
-                "--window-size=1920,1080"
+                "--window-size=1920,1080",
             ]
         )
         context = browser.new_context(
@@ -118,7 +125,7 @@ def main():
             viewport={"width": 1920, "height": 1080},
             locale="en-US",
         )
-        # block images for speed
+        # Block image requests for speed
         context.route("**/*.{png,jpg,jpeg,svg,webp,gif}", lambda route: route.abort())
         page = context.new_page()
 
@@ -158,7 +165,8 @@ def main():
                     )
                 else:
                     cur.execute(
-                        "UPDATE stock_state SET last_state = ?, updated_at = CURRENT_TIMESTAMP "
+                        "UPDATE stock_state "
+                        "SET last_state = ?, updated_at = CURRENT_TIMESTAMP "
                         "WHERE url = ?",
                         (state, url)
                     )
