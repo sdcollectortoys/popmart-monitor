@@ -1,91 +1,144 @@
 #!/usr/bin/env python3
 import os
-import re
 import sys
 import time
+import re
+import json
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 import requests
 
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
-# Comma-separated product URLs, e.g. "https://…/products/2492,https://…/products/2155"
-URLS         = os.environ.get("MONITOR_URLS", "").split(",")
-INTERVAL     = int(os.environ.get("MONITOR_INTERVAL", "60"))
-PUSH_APP_TOKEN = os.environ["PUSHOVER_API_TOKEN"]
-PUSH_USER_KEY  = os.environ["PUSHOVER_USER_KEY"]
-PUSH_URL       = "https://api.pushover.net/1/messages.json"
+# ── CONFIG ────────────────────────────────────────────────────────────
 
-# ─── LOGGING ──────────────────────────────────────────────────────────────────
+# List your SPU IDs here or override via SPU_IDS="878,890,2155,2879,2492"
+if os.environ.get("SPU_IDS"):
+    SPUS = [s.strip() for s in os.environ["SPU_IDS"].split(",") if s.strip()]
+else:
+    SPUS = ["878", "890", "2155", "2879", "2492"]
+
+# How often to poll (seconds)
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
+
+# Health‐check port (Render will inject $PORT)
+PORT = int(os.environ.get("PORT", "5000"))
+
+# Pushover credentials
+PUSH_APP_TOKEN = os.environ.get("PUSHOVER_API_TOKEN")
+PUSH_USER_KEY  = os.environ.get("PUSHOVER_USER_KEY")
+
+# Pushover endpoint
+PUSH_URL = "https://api.pushover.net/1/messages.json"
+
+# ── LOGGING SETUP ───────────────────────────────────────────────────────
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)5s %(message)s",
-    stream=sys.stdout,
+    format="%(asctime)s %(levelname)s %(message)s"
 )
-logger = logging.getLogger("popmart-monitor")
+logger = logging.getLogger(__name__)
 
-# ─── HELPERS ──────────────────────────────────────────────────────────────────
-def get_spu_id_from_url(url: str) -> str:
-    m = re.search(r"/products/(\d+)", url)
-    return m.group(1) if m else None
+# ── HEALTH SERVER ──────────────────────────────────────────────────────
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+def start_health_server():
+    server = HTTPServer(("", PORT), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info(f"Health server running on 0.0.0.0:{PORT}/health")
+
+# ── STOCK FETCHER ──────────────────────────────────────────────────────
 
 def fetch_stock(spu_id: str) -> bool:
     """
-    Returns True if any SKU for this SPU has onlineStock > 0.
+    Returns True if any SKU for spu_id has onlineStock > 0.
     """
-    resp = requests.get(
-        "https://prod-na-api.popmart.com/shop/v1/shop/productDetails",
-        params={"spuId": spu_id},
-        headers={
-            "Accept": "application/json, text/plain, */*",
-            "User-Agent": "Mozilla/5.0 (popmart-stock-checker)"
-        },
-        timeout=10
+    url = f"https://www.popmart.com/us/products/{spu_id}"
+    try:
+        resp = requests.get(url, timeout=15)
+    except requests.RequestException as e:
+        logger.error(f"[SPU {spu_id}] network error: {e}")
+        return False
+
+    if resp.status_code != 200:
+        logger.error(f"[SPU {spu_id}] unexpected HTTP {resp.status_code}")
+        return False
+
+    # extract the JSON blob Next.js injects
+    m = re.search(
+        r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+        resp.text,
+        flags=re.DOTALL
     )
-    resp.raise_for_status()
-    data = resp.json().get("data", {})
-    skus = data.get("skus", [])
-    return any(sku["stock"]["onlineStock"] > 0 for sku in skus)
+    if not m:
+        logger.error(f"[SPU {spu_id}] __NEXT_DATA__ not found in page")
+        return False
 
-def notify(title: str, message: str) -> None:
-    payload = {
-        "token": PUSH_APP_TOKEN,
-        "user":  PUSH_USER_KEY,
-        "title": title,
-        "message": message,
-    }
-    r = requests.post(PUSH_URL, data=payload, timeout=5)
-    r.raise_for_status()
+    try:
+        data = json.loads(m.group(1))
+        pd = data["props"]["pageProps"]["productDetails"]
+        for sku in pd.get("skus", []):
+            if sku.get("stock", {}).get("onlineStock", 0) > 0:
+                return True
+    except Exception as e:
+        logger.error(f"[SPU {spu_id}] error parsing JSON: {e}")
 
-# ─── MAIN LOOP ────────────────────────────────────────────────────────────────
+    return False
+
+# ── PUSHOVER NOTIFIER ─────────────────────────────────────────────────
+
+def send_push(message: str):
+    if not PUSH_APP_TOKEN or not PUSH_USER_KEY:
+        logger.warning("Pushover credentials missing; skipping notification")
+        return
+    try:
+        resp = requests.post(PUSH_URL, data={
+            "token": PUSH_APP_TOKEN,
+            "user":  PUSH_USER_KEY,
+            "message": message,
+        }, timeout=10)
+        resp.raise_for_status()
+        logger.info("Pushover notification sent")
+    except Exception as e:
+        logger.error(f"Pushover error: {e}")
+
+# ── MAIN LOOP ─────────────────────────────────────────────────────────
+
 def main():
-    # initialize all as “out of stock”
-    last_state = {url: False for url in URLS}
+    if not SPUS:
+        logger.error("No SPU IDs configured. Set SPU_IDS env var or update the script.")
+        sys.exit(1)
 
-    logger.info("Starting monitor — polling every %s seconds for %d URLs",
-                INTERVAL, len(URLS))
+    # start the health‐check endpoint
+    start_health_server()
 
-    while True:
-        for url in URLS:
-            url = url.strip()
-            spu = get_spu_id_from_url(url)
-            if not spu:
-                logger.error("Could not parse SPU from URL: %s", url)
-                continue
+    # keep track of last seen stock state
+    last_status = {spu: False for spu in SPUS}
+    logger.info(f"Monitoring SPUs for restock: {SPUS} (interval: {CHECK_INTERVAL}s)")
 
-            try:
+    try:
+        while True:
+            for spu in SPUS:
                 in_stock = fetch_stock(spu)
-            except Exception:
-                logger.exception("Error fetching stock for SPU %s", spu)
-                in_stock = False
-
-            if in_stock and not last_state[url]:
-                logger.info("🔔 %s JUST CAME IN STOCK!", url)
-                notify("POP MART In-Stock!", url)
-            else:
-                logger.debug("%s is %s", url, "IN-STOCK" if in_stock else "OOS")
-
-            last_state[url] = in_stock
-
-        time.sleep(INTERVAL)
+                if in_stock and not last_status[spu]:
+                    msg = f"🎉 SPU {spu} is NOW IN STOCK! → https://www.popmart.com/us/products/{spu}"
+                    logger.info(msg)
+                    send_push(msg)
+                last_status[spu] = in_stock
+            time.sleep(CHECK_INTERVAL)
+    except KeyboardInterrupt:
+        logger.info("Interrupted—shutting down.")
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()
